@@ -32,8 +32,17 @@ HERTZ = 100
 LOOP_INTERVAL = 1.0 / HERTZ
 
 # Packet markers
-PKT_START = 0xAA
+PKT_START = 0xAA   # motor command frame + telemetry frame
+CMD_START = 0xAB   # ASCII CLI command frame to the antenna: [0xAB][len][ascii][0x55]
 PKT_END = 0x55
+
+# Response packet length (firmware src/platform/main.cpp):
+#   [START][ts u64][motorL i16][motorR i16][Rp f][L f][flags u8][crack_size f][END]
+#     1      8        2          2          4     4    1         4             1   = 27
+RESP_LEN = 27
+# flags bit masks
+FLAG_CRACK = 0x01   # a crack was detected this sample (post-calibration)
+FLAG_ROTATED = 0x02 # device rotation/calibration is active
 
 # Recording folder
 #****************************************************************************************************************************
@@ -179,7 +188,18 @@ class SerialComm:
         packet[5] = PKT_END
         
         self.ser.write(packet)
-    
+
+    def send_command(self, text):
+        """Send an ASCII CLI command to the antenna: [0xAB][len][ascii][0x55].
+
+        The antenna feeds it into the same dispatcher as its USB serial CLI, so
+        any CLI command works here (e.g. 'calibrate', 'rotated on', 'save al')."""
+        payload = text.encode('ascii', 'ignore')[:95]
+        packet = bytearray([CMD_START, len(payload)])
+        packet += payload
+        packet.append(PKT_END)
+        self.ser.write(packet)
+
     def read_ldc_packet(self, timeout_ms=8):
         """Wait for and read a complete LDC packet"""
         end_time = time.time() + (timeout_ms / 1000.0)
@@ -191,22 +211,24 @@ class SerialComm:
             
             # Look for start marker
             start_idx = self.read_buffer.find(bytes([PKT_START]))
-            if start_idx >= 0 and len(self.read_buffer) >= start_idx + 22:
-                packet = self.read_buffer[start_idx:start_idx + 22]
-                
+            if start_idx >= 0 and len(self.read_buffer) >= start_idx + RESP_LEN:
+                packet = self.read_buffer[start_idx:start_idx + RESP_LEN]
+
                 # Check end marker
-                if packet[21] == PKT_END:
-                    # Extract 30 bytes of data
-                    data = packet[1:21]
+                if packet[RESP_LEN - 1] == PKT_END:
+                    # Payload is everything between START and END.
+                    data = packet[1:RESP_LEN - 1]
                     try:
                         ts, = struct.unpack('<Q', data[0:8])
                         motors = struct.unpack('<hh', data[8:12])
                         rp, = struct.unpack('<f', data[12:16])
                         l,  = struct.unpack('<f', data[16:20])
-                        
+                        flags = data[20]
+                        crack_size, = struct.unpack('<f', data[21:25])
+
                         # Remove packet from buffer
-                        self.read_buffer = self.read_buffer[start_idx + 22:]
-                        return ts, motors,rp,l
+                        self.read_buffer = self.read_buffer[start_idx + RESP_LEN:]
+                        return ts, motors, rp, l, flags, crack_size
                     except:
                         # Bad data, remove first byte and try again
                         self.read_buffer = self.read_buffer[1:]
@@ -257,6 +279,16 @@ class HDF5Recorder:
             dtype='float32', chunks=True, compression='gzip'
         )
 
+        self.crack_dset = self.h5_file.create_dataset(
+            'crack_detected', (0,), maxshape=(None,),
+            dtype='bool', chunks=True, compression='gzip'
+        )
+
+        self.crack_size_dset = self.h5_file.create_dataset(
+            'crack_size_thou', (0,), maxshape=(None,),
+            dtype='float32', chunks=True, compression='gzip'
+        )
+
         self.frame_flag_dset = self.h5_file.create_dataset(
             'frame_captured', (0,), maxshape=(None,),
             dtype='bool', chunks=True, compression='gzip'
@@ -274,25 +306,29 @@ class HDF5Recorder:
         
         self.sample_count = 0
     
-    def append(self, ts, motors, rp, l, frame_captured, frame_num):
+    def append(self, ts, motors, rp, l, crack_detected, crack_size, frame_captured, frame_num):
         idx = self.sample_count
-        
+
         # Resize
         self.ts_dset.resize((idx + 1,))
         self.motor_dset.resize((idx + 1, 2))
         self.rp_dset.resize((idx + 1,))
         self.l_dset.resize((idx + 1,))
+        self.crack_dset.resize((idx + 1,))
+        self.crack_size_dset.resize((idx + 1,))
         self.frame_flag_dset.resize((idx + 1,))
         self.frame_num_dset.resize((idx + 1,))
-        
+
         # Write
         self.ts_dset[idx] = ts
         self.motor_dset[idx] = motors
         self.rp_dset[idx] = rp
         self.l_dset[idx] = l
+        self.crack_dset[idx] = crack_detected
+        self.crack_size_dset[idx] = crack_size
         self.frame_flag_dset[idx] = frame_captured
         self.frame_num_dset[idx] = frame_num if frame_captured else -1
-        
+
         self.sample_count += 1
     
     def close(self):
@@ -321,6 +357,12 @@ class JoystickControl:
         self.recording = False
         self.running = True
         self.smoothing_window = 10
+
+        # On-device CLI commands queued by button presses, drained in the main
+        # loop and sent to the antenna. `rotated` mirrors the device's rotation
+        # state (kept in sync from telemetry flags) so the toggle stays correct.
+        self.pending_commands = []
+        self.rotated = False
 
         # For labeling materials on the scatter plot
         self.material_label_count = 0
@@ -411,6 +453,17 @@ class JoystickControl:
                 vb_right.setYRange(0, 100)
             print("\nPlot reset and limits reset")
 
+        # Left stick click - run on-device PCA calibration
+        elif event.button == 9:
+            self.pending_commands.append("calibrate")
+            print("\n[cmd] calibrate")
+
+        # Right stick click - toggle on-device rotation (calibrated flatten)
+        elif event.button == 10:
+            self.rotated = not self.rotated
+            self.pending_commands.append("rotated on" if self.rotated else "rotated off")
+            print(f"\n[cmd] rotated {'on' if self.rotated else 'off'}")
+
         # Left trigger - decrease smoothing window
         elif event.button == 6:
             self.smoothing_window = max(1, self.smoothing_window - 1)
@@ -467,14 +520,15 @@ class JoystickControl:
         print(f"\nRECORDING stopped")
         self.session_folder = None
     
-    def log_data(self, ts, motors,rp, l, frame_info):
+    def log_data(self, ts, motors, rp, l, crack_detected, crack_size, frame_info):
         """Log one sample if recording"""
         if self.recording and self.h5_recorder:
             frame_captured = frame_info is not None
             frame_num = frame_info[1] if frame_info else -1
-            
+
             self.h5_recorder.append(
-                ts, motors,rp, l,
+                ts, motors, rp, l,
+                crack_detected, crack_size,
                 frame_captured, frame_num
             )
 
@@ -486,12 +540,12 @@ def main():
     print(f"BBot Control - {HERTZ}Hz Request-Response Mode")
     print("=" * 60)
     print("Controls:")
-    print("  Left Stick: Left motor")
-    print("  Right Stick: Right motor")
-    print("  LB/RB: Power -/+")
-    print("  B: Reverse polarity")
-    print("  A: Start/Stop recording")
-    print("  MENU: Quit")
+    print("  Left Stick: Left motor      Right Stick: Right motor")
+    print("  LB/RB: Power -/+            LT/RT: Smoothing window -/+")
+    print("  A: Start/Stop recording    B: Place material marker    X: Reset plot")
+    print("  L-Stick click: Calibrate (on-device)")
+    print("  R-Stick click: Toggle rotation (on-device)")
+    print("  Back/View: Quit")
     print("=" * 60)
     
     # Initialize
@@ -523,6 +577,11 @@ def main():
             # ===== 1. Get joystick input =====
             left, right = joystick.update()
             
+            # ===== 1b. Send any queued on-device CLI commands (calibrate / rotate) =====
+            for cmd in joystick.pending_commands:
+                serial_comm.send_command(cmd)
+            joystick.pending_commands.clear()
+
             # ===== 2. Send motor command =====
             serial_comm.send_motor_command(left*-1, right)
             
@@ -546,8 +605,12 @@ def main():
             
             if ldc_packet:
                 response_success += 1
-                ts, motors, rp, l = ldc_packet
-                
+                ts, motors, rp, l, flags, crack_size = ldc_packet
+                crack_detected = bool(flags & FLAG_CRACK)
+                device_calibrated = bool(flags & FLAG_ROTATED)
+                # Keep the rotate-toggle in sync with the device's actual state.
+                joystick.rotated = device_calibrated
+
                 if not plot_ready:
                     init_plot_window()
 
@@ -617,9 +680,17 @@ def main():
                     
                     plot_QtGui.QApplication.processEvents()
 
+                if crack_detected:
+                    # Mark the detection on the scatter plot and announce it.
+                    if plot_ready and plot_scatter is not None and len(plot_rp) > 0:
+                        marker = plot_pg.TextItem("x", anchor=(0.5, 0.5), color=(255, 0, 0))
+                        marker.setPos(plot_rp[-1], plot_l[-1])
+                        plot_scatter.addItem(marker)
+                    print(f"\n>>> CRACK detected: size~{crack_size:.1f} thou")
+
                 print(f"\r{ts/1e6:.3f},{rp:.2f},{l:.2f}uH", end='')
                 # Log if recording
-                joystick.log_data(ts, motors,rp,l, frame_info)
+                joystick.log_data(ts, motors, rp, l, crack_detected, crack_size, frame_info)
             else:
                 response_timeout += 1
             
