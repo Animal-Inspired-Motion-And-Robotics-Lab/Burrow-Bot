@@ -11,6 +11,7 @@ import h5py
 import os
 import subprocess
 import sys
+import math
 
 from datetime import datetime
 from typing import Any
@@ -30,7 +31,7 @@ except Exception as e:
     print(f"pyqtgraph availability subprocess check failed: {e}")
 
 # ===== CONFIGURATION =====
-PORT = 'COM22'
+PORT = 'COM5'
 BAUDRATE = 460800
 HERTZ = 100
 LOOP_INTERVAL = 1.0 / HERTZ
@@ -93,6 +94,10 @@ plot_scatter: Any = None
 plot_curve_time_l: Any = None
 plot_curve_time_rp: Any = None
 plot_curve_scatter: Any = None
+plot_readout: Any = None  # live LDC1101 packet readout (LabelItem)
+plot_container: Any = None  # top-level QWidget wrapping plots + CLI input row
+plot_cmd_input: Any = None  # QLineEdit for typing antenna CLI commands
+plot_cmd_status: Any = None  # QLabel echoing the last command sent
 vb_right: Any = None
 plot_pg: Any = None
 plot_QtGui: Any = None
@@ -100,13 +105,9 @@ plot_l = []
 plot_rp = []
 plot_ready = False
 
-def init_plot_window():
-    global plot_app, plot_layout, plot_time, plot_scatter, plot_curve_time_l, plot_curve_time_rp, plot_curve_scatter, vb_right, plot_ready
-
-    if not pyqtgraph_available:
-        print("plot window not available: pyqtgraph unavailable")
-        plot_ready = False
-        return
+def init_plot_window(joystick=None):
+    global plot_app, plot_layout, plot_time, plot_scatter, plot_curve_time_l, plot_curve_time_rp, plot_curve_scatter, plot_readout, vb_right, plot_ready
+    global plot_container, plot_cmd_input, plot_cmd_status
 
     global plot_pg, plot_QtGui
     try:
@@ -167,8 +168,60 @@ def init_plot_window():
         plot_curve_time_rp = plot_pg.PlotCurveItem([], [], pen=plot_pg.mkPen('yellow', width=2))  # right axis for Rp
         vb_right.addItem(plot_curve_time_rp)
         plot_curve_scatter = plot_scatter.plot([], [], pen=None, symbol='o', symbolPen=None, symbolBrush=None, symbolSize=5)
-        
-        plot_layout.show()
+
+        # Live raw-packet readout spanning both columns. Shows exactly what the
+        # LDC1101 is sending each tick, INCLUDING NaN/timeout packets that the
+        # plots silently drop, so a dead/misconfigured sensor is visible at a glance.
+        plot_readout = plot_layout.addLabel(
+            "LDC1101: waiting for first packet...",
+            row=1, col=0, colspan=2,
+            justify='left', size='11pt'
+        )
+
+        # ----- Wrap the plots in a container that also holds a CLI input row -----
+        # Lets the operator type antenna CLI commands (status, q 15, calibrate,
+        # save al, ...) straight from the plot window. Commands are queued onto
+        # joystick.pending_commands and the main loop sends them over the bridge
+        # via serial_comm.send_command() (the [0xAB][len][ascii][0x55] frame).
+        plot_container = plot_QtGui.QWidget()
+        plot_container.setWindowTitle("BBot Telemetry + CLI")
+        vbox = plot_QtGui.QVBoxLayout(plot_container)
+        vbox.setContentsMargins(4, 4, 4, 4)
+        vbox.addWidget(plot_layout)
+
+        cmd_row = plot_QtGui.QHBoxLayout()
+        cmd_label = plot_QtGui.QLabel("Antenna CLI:")
+        plot_cmd_input = plot_QtGui.QLineEdit()
+        plot_cmd_input.setPlaceholderText("e.g.  status   help   q 15   calibrate   save al")
+        plot_cmd_send = plot_QtGui.QPushButton("SEND")
+        plot_cmd_status = plot_QtGui.QLabel("")
+        plot_cmd_status.setStyleSheet("color: #888;")
+        cmd_row.addWidget(cmd_label)
+        cmd_row.addWidget(plot_cmd_input, 1)
+        cmd_row.addWidget(plot_cmd_send)
+        cmd_row.addWidget(plot_cmd_status)
+        vbox.addLayout(cmd_row)
+
+        def send_cli_command():
+            text = plot_cmd_input.text().strip()
+            if not text:
+                return
+            if joystick is not None:
+                # Drained next loop tick by serial_comm.send_command(); same path
+                # as the stick-click calibrate/rotate bindings.
+                joystick.pending_commands.append(text)
+                plot_cmd_status.setText(f"sent: {text}")
+                print(f"\n[CLI] queued -> antenna: {text!r}")
+            else:
+                plot_cmd_status.setText("no link")
+            plot_cmd_input.clear()
+            plot_cmd_input.setFocus()
+
+        plot_cmd_send.clicked.connect(send_cli_command)
+        plot_cmd_input.returnPressed.connect(send_cli_command)  # Enter also sends
+
+        plot_container.resize(1200, 680)
+        plot_container.show()
         plot_ready = True
         print("plot windows initialized successfully")
     except Exception as e:
@@ -234,7 +287,11 @@ class SerialComm:
                         flags = data[20]
                         crack_size, = struct.unpack('<f', data[21:25])
 
-                        # Remove packet from buffer
+                        # The END marker (checked above) is enough to trust this
+                        # frame, so return it even when Rp/L are NaN. NaN means the
+                        # firmware's LDC read failed (NO_SENSOR_OSC / DRDYB timeout /
+                        # dead SPI); the caller surfaces it in the readout instead of
+                        # us silently dropping it and masking a dead sensor.
                         self.read_buffer = self.read_buffer[start_idx + RESP_LEN:]
                         return ts, motors, rp, l, flags, crack_size
                     except:
@@ -564,6 +621,9 @@ def main():
         return
     
     serial_comm = SerialComm(PORT, BAUDRATE)
+
+    # Bring up plots immediately; data will fill in as packets arrive.
+    init_plot_window(joystick)
     
     # Clear any stale data
     serial_comm.clear_buffer()
@@ -574,6 +634,7 @@ def main():
     loop_count = 0
     response_success = 0
     response_timeout = 0
+    response_nan = 0  # packets received but with NaN Rp/L (sensor read failed)
     frame_counter = 0
     
     try:
@@ -612,15 +673,48 @@ def main():
             ldc_packet = serial_comm.read_ldc_packet(timeout_ms)
             
             if ldc_packet:
-                response_success += 1
                 ts, motors, rp, l, flags, crack_size = ldc_packet
+
+                # ----- Live raw-packet readout (shows NaN packets too) -----
+                # Updated here, BEFORE the finite-gate below, so a dead or
+                # misconfigured LDC1101 (which sends NaN) is still visible.
+                if plot_ready and plot_readout is not None:
+                    rp_finite = math.isfinite(rp)
+                    l_finite = math.isfinite(l)
+                    sensor_ok = rp_finite and l_finite
+                    cal = bool(flags & FLAG_ROTATED)
+                    crk = bool(flags & FLAG_CRACK)
+                    color = '#33ff33' if sensor_ok else '#ff5050'
+                    rp_str = f"{rp:.2f}" if rp_finite else "NaN"
+                    l_str = f"{l:.3f}" if l_finite else "NaN"
+                    cs_str = f"{crack_size:.1f}" if math.isfinite(crack_size) else "NaN"
+                    plot_readout.setText(
+                        f"<span style='color:{color}'>"
+                        f"Rp={rp_str} &#937;&nbsp;&nbsp; L={l_str} uH</span>"
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp; flags=0x{flags:02X} "
+                        f"(calibrated={int(cal)}, crack={int(crk)})"
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp; crack_size={cs_str} thou"
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp; good={response_success} "
+                        f"nan={response_nan} timeouts={response_timeout}",
+                        size='11pt'
+                    )
+                    plot_QtGui.QApplication.processEvents()
+
+                if not (math.isfinite(rp) and math.isfinite(l)):
+                    # Packet arrived but the sensor read failed (NaN). Count it
+                    # separately from a true link timeout so the readout can tell
+                    # "dead sensor" from "no packets".
+                    response_nan += 1
+                    continue
+
+                # Finite, usable sample.
+                response_success += 1
+                if not math.isfinite(crack_size):
+                    crack_size = 0.0
                 crack_detected = bool(flags & FLAG_CRACK)
                 device_calibrated = bool(flags & FLAG_ROTATED)
                 # Keep the rotate-toggle in sync with the device's actual state.
                 joystick.rotated = device_calibrated
-
-                if not plot_ready:
-                    init_plot_window()
 
                 if plot_ready:
                     plot_l.append(l)
@@ -643,6 +737,17 @@ def main():
                         avg_rp = sum(segment_rp) / len(segment_rp)
                         smoothed_l.append(avg_l)
                         smoothed_rp.append(avg_rp)
+
+                    # Keep only finite points for plotting and ranges.
+                    finite_points = [
+                        (x, y) for x, y in zip(smoothed_rp, smoothed_l)
+                        if math.isfinite(x) and math.isfinite(y)
+                    ]
+                    if not finite_points:
+                        plot_QtGui.QApplication.processEvents()
+                        continue
+                    smoothed_rp = [p[0] for p in finite_points]
+                    smoothed_l = [p[1] for p in finite_points]
                     
                     # Create color gradient from red (old) to orange, with last 20 points bright white
                     num_points = len(smoothed_l)
@@ -701,7 +806,16 @@ def main():
                 joystick.log_data(ts, motors, rp, l, crack_detected, crack_size, frame_info)
             else:
                 response_timeout += 1
-            
+                if plot_ready and plot_readout is not None:
+                    plot_readout.setText(
+                        f"<span style='color:#ffaa00'>no telemetry packet "
+                        f"(timeout)</span>&nbsp;&nbsp;|&nbsp;&nbsp; "
+                        f"good={response_success} nan={response_nan} "
+                        f"timeouts={response_timeout}",
+                        size='11pt'
+                    )
+                    plot_QtGui.QApplication.processEvents()
+
             # ===== 5. Maintain loop timing =====
             loop_count += 1
             elapsed = time.time() - cycle_start
@@ -728,6 +842,7 @@ def main():
                 loop_count = 0
                 response_success = 0
                 response_timeout = 0
+                response_nan = 0
                 last_status = time.time()
     
     except KeyboardInterrupt:
