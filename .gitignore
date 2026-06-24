@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Python virtual environment (rebuild with: pip install -r requirements.txt)
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc

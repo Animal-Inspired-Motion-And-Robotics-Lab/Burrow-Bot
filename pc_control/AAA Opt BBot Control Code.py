@@ -1,15 +1,19 @@
+####CONTROL CODE - controls the EddyBurrowBot with an XBox controller, outputs the data
+#NOTE - You must use an older version of Python for these libraries 
+#(Tested on Python 3.12.1)
+
 import pygame
 import serial
 import struct
 import time
 import cv2
 import h5py
-import numpy as np
 import os
 import subprocess
 import sys
 
 from datetime import datetime
+from typing import Any
 
 # pyqtgraph availability is checked in subprocess to avoid crashes in this process
 pyqtgraph_available = False
@@ -78,16 +82,20 @@ video_out = None
 current_video_path = None
 
 # ===== GLOBAL PLOTTING STATE =====
-plot_app = None
-plot_layout = None
-plot_time = None
-plot_scatter = None
-plot_curve_time_l = None
-plot_curve_time_rp = None
-plot_curve_scatter = None
-vb_right = None
-plot_pg = None
-plot_QtGui = None
+# Typed Any: these are seeded to None here and reassigned to live pyqtgraph / Qt
+# objects in init_plot_window(). Any keeps the type checker from treating every
+# later .setData()/.QApplication/etc. as access on None (the code guards real
+# use behind plot_ready).
+plot_app: Any = None
+plot_layout: Any = None
+plot_time: Any = None
+plot_scatter: Any = None
+plot_curve_time_l: Any = None
+plot_curve_time_rp: Any = None
+plot_curve_scatter: Any = None
+vb_right: Any = None
+plot_pg: Any = None
+plot_QtGui: Any = None
 plot_l = []
 plot_rp = []
 plot_ready = False
@@ -492,7 +500,7 @@ class JoystickControl:
         self.h5_recorder = HDF5Recorder(self.session_folder)
         
         # Start video recording
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore[attr-defined]  # valid at runtime; missing from cv2 stubs
         current_video_path = get_new_filename(self.session_folder, "video", ".mp4")
         video_out = cv2.VideoWriter(current_video_path, fourcc, fps, (width, height))
         
@@ -682,7 +690,7 @@ def main():
 
                 if crack_detected:
                     # Mark the detection on the scatter plot and announce it.
-                    if plot_ready and plot_scatter is not None and len(plot_rp) > 0:
+                    if plot_ready and len(plot_rp) > 0:
                         marker = plot_pg.TextItem("x", anchor=(0.5, 0.5), color=(255, 0, 0))
                         marker.setPos(plot_rp[-1], plot_l[-1])
                         plot_scatter.addItem(marker)
