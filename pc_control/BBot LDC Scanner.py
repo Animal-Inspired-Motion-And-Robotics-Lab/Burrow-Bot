@@ -533,6 +533,11 @@ class _ControllerReader(threading.Thread):
         self._running = True
 
     def run(self):
+        # The slow (~125 ms) pump is SDL re-scanning DirectInput/RawInput devices
+        # each pump. An Xbox pad speaks XInput, so disable the other backends to
+        # kill that per-pump enumeration. Must be set before pygame.init().
+        os.environ["SDL_DIRECTINPUT_ENABLED"] = "0"
+        os.environ["SDL_JOYSTICK_RAWINPUT"] = "0"
         try:
             pygame.init()
             pygame.joystick.init()
@@ -552,8 +557,20 @@ class _ControllerReader(threading.Thread):
             return
 
         self.ready.set()
+        # TEMP perf: report the pump cost so we can see if the hints sped it up.
+        pump_sum = 0.0
+        pump_cnt = 0
+        pump_max = 0.0
+        last_report = time.monotonic()
         while self._running:
-            for event in pygame.event.get():        # also pumps; the slow part
+            t0 = time.perf_counter()
+            events = pygame.event.get()             # also pumps; the slow part
+            dt = time.perf_counter() - t0
+            pump_sum += dt
+            pump_cnt += 1
+            pump_max = max(pump_max, dt)
+
+            for event in events:
                 if event.type == pygame.JOYBUTTONDOWN:
                     self.buttons.put(event.button)
             try:
@@ -564,6 +581,16 @@ class _ControllerReader(threading.Thread):
             with self._lock:
                 self._axis1 = a1
                 self._axis3 = a3
+
+            now = time.monotonic()
+            if now - last_report >= 2.0 and pump_cnt:
+                print(f"[perf] js_pump(thread): avg={pump_sum / pump_cnt * 1e3:.1f}ms "
+                      f"max={pump_max * 1e3:.1f}ms n={pump_cnt}")
+                pump_sum = 0.0
+                pump_cnt = 0
+                pump_max = 0.0
+                last_report = now
+
             time.sleep(0.005)
 
     def axes(self):
