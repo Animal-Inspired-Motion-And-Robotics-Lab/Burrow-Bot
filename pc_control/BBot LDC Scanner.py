@@ -635,11 +635,14 @@ class JoystickControl:
         elif button == 0:                   # X - send `calibrate`
             command_queue.append("calibrate")
             print("\n[cmd] calibrate")
+        elif button == 11:                  # R-stick click - vibrate (liftoff dither)
+            command_queue.append("vibrate")
+            print("\n[cmd] vibrate")
         elif button == 3:                   # Y - toggle on-device rotation
             self.rotated = not self.rotated
             command_queue.append("rotated on" if self.rotated else "rotated off")
             print(f"\n[cmd] rotated {'on' if self.rotated else 'off'}")
-        elif button == 10:                  # R-stick click - reset all plots
+        elif button == 10:                  # L-stick click - reset all plots
             reset_view()
         elif button == 8:                   # Back/View - quit
             request_quit()
@@ -928,7 +931,7 @@ controls_overlay.setText(
     "LB / RB: power - / +\n"
     "A: CSV write   B: material marker\n"
     "X: calibrate   Y: toggle rotation\n"
-    "R-click: reset plots   Back/View: quit"
+    "L-click: reset plots   R-click: vibrate   Back/View: quit"
 )
 controls_overlay.setStyleSheet(
     "color: rgba(200, 200, 200, 150); font-size: 14px; background: transparent;"
@@ -1754,7 +1757,7 @@ def main():
     print("Connect the bridge link (lower-right), then drive / configure:")
     print("  Left Stick: left motor      Right Stick: right motor")
     print("  LB/RB: power -/+            A: toggle CSV write      B: material marker")
-    print("  X: calibrate   Y: toggle rotation   R-click: reset plots   Space: reset")
+    print("  X: calibrate   Y: toggle rotation   L-click: reset plots   R-click: vibrate")
     print("  Back/View: quit             P: pause   F: CSV write   1/2/3: 3D views")
     print("  Click the phase-plot x-axis to toggle R_p <-> Time; crack-plot y-axis for size <-> mag")
     print("=" * 64)

@@ -106,6 +106,35 @@ static constexpr uint32_t kCrackLedHoldMs = 60;
 // elapsed since this (see loop()); inbound motor/CLI handling stays every-loop.
 static uint32_t lastSampleMs = 0;
 
+// ===== VIBRATE (calibration liftoff dither) =====
+// A non-blocking burst that alternately twists the treads in opposite directions
+// (L+,R-) then (L-,R+) at a configurable rate, jostling the sensor so its liftoff
+// varies WHILE telemetry keeps streaming -- the idea being to let `calibrate`
+// separate the material's conductivity from liftoff. Triggered by the `vibrate`
+// CLI command (params owned by serial_commands; left-stick click on the PC sends
+// it). While a burst runs it overrides PC motor commands; on finish it stops the
+// motors. Tune strength/freq/duration live via `vibrate <strength> <freq> <ms>`.
+static bool vibrateActive = false;
+static uint32_t vibrateEndMs = 0;
+static uint32_t vibrateNextToggleMs = 0;
+static uint32_t vibrateHalfPeriodMs = 25;  // each opposite-direction phase holds this long
+static int16_t vibrateStrength = 0;        // PWM magnitude per tread
+static int vibratePhase = 0;               // 0 / 1 -> which tread leads
+
+// Begin a vibrate burst. One full cycle = two opposite-direction phases, so each
+// phase holds 1000/freq/2 ms. Clamped to safe ranges.
+void startVibrate(int16_t strength, float freq_hz, uint32_t duration_ms) {
+  vibrateStrength = constrain(strength, (int16_t)0, (int16_t)255);
+  if (freq_hz < 0.1f) freq_hz = 0.1f;
+  vibrateHalfPeriodMs = (uint32_t)(500.0f / freq_hz);
+  if (vibrateHalfPeriodMs < 1) vibrateHalfPeriodMs = 1;
+  uint32_t now = millis();
+  vibrateEndMs = now + duration_ms;
+  vibrateNextToggleMs = now;               // first toggle happens immediately
+  vibratePhase = 0;
+  vibrateActive = true;
+}
+
 // ===== MOTOR FUNCTIONS =====
 void setLeftMotor(int16_t pwm) {
   pwm = constrain(pwm, -255, 255);
@@ -240,7 +269,9 @@ void serviceSerial1() {
           if (rxBuf[4] == PKT_END) {
             int16_t left = (int16_t)((rxBuf[0] << 8) | rxBuf[1]);
             int16_t right = (int16_t)((rxBuf[2] << 8) | rxBuf[3]);
-            setMotors(left, right);
+            if (!vibrateActive) {            // a vibrate burst owns the motors
+              setMotors(left, right);
+            }
           }
           rxState = RX_IDLE;
         }
@@ -332,6 +363,29 @@ void loop() {
   serial_command_config_t config = serialCommandsGetConfig();
 
   uint32_t now = millis();
+
+  // 2b. Vibrate burst (calibration liftoff dither). Runs every loop, not gated
+  //     by the sample pacing, so the twist timing is precise. Start one when a
+  //     `vibrate` request is pending, then drive/stop it; it overrides motors.
+  {
+    int16_t vStrength;
+    float vFreq;
+    uint32_t vDuration;
+    if (serialCommandsTakeVibrateRequest(&vStrength, &vFreq, &vDuration)) {
+      startVibrate(vStrength, vFreq, vDuration);
+    }
+    if (vibrateActive) {
+      if (now >= vibrateEndMs) {
+        vibrateActive = false;
+        setMotors(0, 0);
+      } else if (now >= vibrateNextToggleMs) {
+        vibratePhase ^= 1;
+        vibrateNextToggleMs = now + vibrateHalfPeriodMs;
+        int16_t s = vibrateStrength;
+        setMotors(vibratePhase ? s : (int16_t)-s, vibratePhase ? (int16_t)-s : s);
+      }
+    }
+  }
 
   // 3. Pace the sensor read + telemetry stream to reading_delay_ms (the CLI
   //    `delay`). millis() wrap is handled by the unsigned subtraction.

@@ -146,6 +146,18 @@ only needs the sensor over the substrate — connect USB to the Platform, then o
 the USB serial CLI: `calibrate` → optionally `save <material>` / `retrieve
 <material>` / `materials`. `help` / `status` list everything.
 
+**Vibrate (experimental liftoff dither).** `vibrate [strength freq_hz duration_ms]`
+runs a non-blocking burst that alternately twists the treads in opposite
+directions (L+,R- ↔ L-,R+) to jostle the sensor and vary liftoff *while telemetry
+keeps streaming* — the goal being to let `calibrate` separate material
+conductivity from liftoff. Bare `vibrate` re-runs with the last params; the
+right-stick click sends it. The pulsing lives in `main.cpp` (`startVibrate` +
+loop, which owns the motors and overrides PC motor commands during a burst);
+`serial_commands` stages the params + a one-shot flag
+(`serialCommandsTakeVibrateRequest`). Defaults: 180 PWM / 20 Hz / 1500 ms — tune
+to find what mechanically resonates this chassis. (Rapid full-PWM reversals
+stress the DRV8835/motors; keep bursts short while experimenting.)
+
 ## Pin map (Platform, XIAO ESP32-S3)
 
 | Pins        | Use                                          |

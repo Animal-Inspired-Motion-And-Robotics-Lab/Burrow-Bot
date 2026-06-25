@@ -48,6 +48,18 @@ static constexpr float kPicoToBase = 1.0e-12f;
 static char gCommandBuffer[kCommandBufferLen];
 static size_t gCommandLength = 0;
 
+// Vibrate (calibration liftoff dither) parameters + a one-shot request flag the
+// main loop consumes via serialCommandsTakeVibrateRequest(). Defaults are the
+// starting point for tuning; change them live with `vibrate <strength> <freq>
+// <duration_ms>`, or edit these to change the boot defaults.
+static constexpr int16_t kDefaultVibrateStrength = 180;     // PWM per tread (0..255)
+static constexpr float kDefaultVibrateFreqHz = 20.0f;       // twist reversals/sec
+static constexpr uint32_t kDefaultVibrateDurationMs = 1500;
+static int16_t gVibrateStrength = kDefaultVibrateStrength;
+static float gVibrateFreqHz = kDefaultVibrateFreqHz;
+static uint32_t gVibrateDurationMs = kDefaultVibrateDurationMs;
+static bool gVibratePending = false;
+
 const char* modeToString(ldc1101_mode_t mode) {
   return mode == LDC1101_MODE_LHR ? "lhr" : "lrp";
 }
@@ -98,6 +110,7 @@ void printHelp() {
   Reply.println("  angle [radians]            // get/set rotation angle");
   Reply.println("  calibrate [samples]        // run PCA calibration on recent samples");
   Reply.println("  baseline [samples]         // re-anchor rotation center to recent flat signal");
+  Reply.println("  vibrate [str freq_hz ms]   // pulse treads opposite to dither liftoff");
 
   // Crack detection tuning.
   Reply.println("  crack_window [n]           // parabola fit window samples");
@@ -586,6 +599,40 @@ void processCommand(char* line) {
     return;
   }
 
+  // --- Vibrate (calibration liftoff dither) -------------------------------
+  // `vibrate` triggers a burst with the current params; `vibrate <strength>
+  // <freq_hz> <duration_ms>` updates all three then triggers. main.cpp does the
+  // actual motor pulsing (it owns the motors); we just stage params + a flag.
+  if (strcmp(token, "vibrate") == 0) {
+    char* a = strtok(nullptr, " \t");
+    if (a != nullptr) {
+      char* b = strtok(nullptr, " \t");
+      char* c = strtok(nullptr, " \t");
+      if (b == nullptr || c == nullptr || strtok(nullptr, " \t") != nullptr) {
+        Reply.println("ERR usage: vibrate [strength freq_hz duration_ms]");
+        return;
+      }
+      long strength = strtol(a, nullptr, 10);
+      float freq = strtof(b, nullptr);
+      long duration = strtol(c, nullptr, 10);
+      if (strength < 0 || strength > 255 || freq <= 0.0f || duration <= 0) {
+        Reply.println("ERR vibrate: strength 0..255, freq_hz > 0, duration_ms > 0");
+        return;
+      }
+      gVibrateStrength = (int16_t)strength;
+      gVibrateFreqHz = freq;
+      gVibrateDurationMs = (uint32_t)duration;
+    }
+    gVibratePending = true;
+    Reply.print("OK vibrate strength=");
+    Reply.print(gVibrateStrength);
+    Reply.print(" freq_hz=");
+    Reply.print(gVibrateFreqHz, 2);
+    Reply.print(" duration_ms=");
+    Reply.println((unsigned long)gVibrateDurationMs);
+    return;
+  }
+
   // `rotate` and `rotation` are accepted as aliases for `rotated` so the
   // command is forgiving of how the user remembers it.
   if (strcmp(token, "rotate") == 0 ||
@@ -762,6 +809,20 @@ void serialCommandsProcessLine(const char* line) {
   Reply.beginBridgeCapture();
   processCommand(buf);
   Reply.endBridgeCapture();
+}
+
+// One-shot pull of a pending `vibrate` request. Returns true exactly once per
+// `vibrate` command, writing the staged params; main.cpp starts the burst.
+bool serialCommandsTakeVibrateRequest(int16_t* strength, float* freq_hz,
+                                      uint32_t* duration_ms) {
+  if (!gVibratePending) {
+    return false;
+  }
+  gVibratePending = false;
+  if (strength != nullptr) *strength = gVibrateStrength;
+  if (freq_hz != nullptr) *freq_hz = gVibrateFreqHz;
+  if (duration_ms != nullptr) *duration_ms = gVibrateDurationMs;
+  return true;
 }
 
 // Snapshots of the live state for main.cpp. Returned by value (small structs)

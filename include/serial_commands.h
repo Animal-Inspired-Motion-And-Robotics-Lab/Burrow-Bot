@@ -51,4 +51,10 @@ void serialCommandsProcessLine(const char* line);
 serial_command_state_t serialCommandsGetState(void);
 serial_command_config_t serialCommandsGetConfig(void);
 
+// One-shot: returns true once after a `vibrate` command, writing the staged
+// burst params (PWM strength 0..255, frequency Hz, duration ms). main.cpp polls
+// this each loop and starts the non-blocking vibrate burst (it owns the motors).
+bool serialCommandsTakeVibrateRequest(int16_t* strength, float* freq_hz,
+                                      uint32_t* duration_ms);
+
 #endif
