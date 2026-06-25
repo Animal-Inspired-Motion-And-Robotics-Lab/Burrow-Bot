@@ -66,9 +66,11 @@ static constexpr float kSensorQ = 15.0f;       // LC tank quality factor
 static constexpr int kSwitchEnable = 0;
 static constexpr int kSwitchGpio = -1;
 
-// Sample pacing is driven by the PC request rate (~100 Hz), so the CLI's
-// reading_delay_ms is unused on this firmware (kept at 0).
-static constexpr uint32_t kDefaultReadingDelayMs = 0;
+// The loop free-runs, so the telemetry stream rate is paced by the CLI `delay`
+// (reading_delay_ms): the sensor is read + a packet streamed at most once every
+// reading_delay_ms (1000/delay Hz). Boot default 25 ms = 40 Hz; change live with
+// `delay <ms>`. A small value approaches the LDC read rate (the hard ceiling).
+static constexpr uint32_t kDefaultReadingDelayMs = 25;
 
 // Onboard LED polarity (XIAO active-low; this Platform LED on pin 21 is active-high).
 static constexpr bool kLedActiveHigh = true;
@@ -98,6 +100,11 @@ static uint8_t txBuffer[27];
 // request/response loop and trip PC-side response timeouts.
 static uint32_t crackLedOffMs = 0;
 static constexpr uint32_t kCrackLedHoldMs = 60;
+
+// Pacing for the telemetry stream: timestamp (millis) of the last sampled tick.
+// The loop reads the sensor + streams a packet only once reading_delay_ms has
+// elapsed since this (see loop()); inbound motor/CLI handling stays every-loop.
+static uint32_t lastSampleMs = 0;
 
 // ===== MOTOR FUNCTIONS =====
 void setLeftMotor(int16_t pwm) {
@@ -198,64 +205,69 @@ void setup() {
   Serial.println("Burrow-Bot Platform: LDC1101 pipeline initialized");
 }
 
-// ===== HANDLE CLI COMMAND FRAME =====
-// PC -> Platform command frame: [0xAB][len u8][len ASCII bytes][0x55]. Feeds the
-// ASCII command into the same dispatcher as the USB CLI (calibrate, rotated
-// on|off, save <name>, ...). Bounded waits keep a torn frame from stalling the
-// loop; Serial1.setTimeout() (set in setup) caps the payload read.
-void handleCommandFrame() {
-  // Length byte.
-  int len = -1;
-  uint32_t start = millis();
-  while ((len = Serial1.read()) < 0) {
-    if (millis() - start > 20) return;  // torn frame — give up
-  }
-  if (len <= 0 || len > 95) return;     // must fit the CLI buffer (96 incl. NUL)
+// ===== SERVICE INBOUND SERIAL (non-blocking) =====
+// The PC streams two kinds of frame to us over Serial1, asynchronously:
+//   * motor command  [0xAA][L i16 BE][R i16 BE][0x55]   -> drive the motors
+//   * CLI command     [0xAB][len u8][len ASCII][0x55]    -> serialCommandsProcessLine
+// We drain whatever bytes are available each loop() with a small byte-at-a-time
+// state machine and apply the latest motor command immediately. NOTHING here
+// blocks — that is the whole point of the free-running design: the Platform no
+// longer waits for a request before streaming a reply (see loop()). A bad
+// length or END byte just drops the frame and resyncs at the next start byte.
+namespace {
+enum RxState { RX_IDLE, RX_MOTOR, RX_CMD_LEN, RX_CMD_DATA, RX_CMD_END };
+RxState rxState = RX_IDLE;
+uint8_t rxBuf[96];     // CLI payload (<=95) + NUL, or 5 motor bytes
+int rxGot = 0;
+int rxCmdLen = 0;
+}  // namespace
 
-  // Payload.
-  char buf[96];
-  size_t got = Serial1.readBytes(buf, len);
-  if (got != (size_t)len) return;
-  buf[len] = '\0';
-
-  // End marker.
-  int endMarker = -1;
-  start = millis();
-  while ((endMarker = Serial1.read()) < 0) {
-    if (millis() - start > 20) return;
-  }
-  if (endMarker != PKT_END) return;     // framing error — drop
-
-  serialCommandsProcessLine(buf);
-}
-
-// ===== READ MOTOR COMMAND =====
-// Blocks until a framed motor command arrives on Serial1, then drives the
-// motors. This blocking wait is the request/response sync with the PC.
-// Interleaved CLI command frames (0xAB) are dispatched inline as they arrive.
-bool readMotorCommand() {
-  while (true) {
-    int b = Serial1.read();
-    if (b == PKT_START) break;                 // motor frame — read it below
-    if (b == CMD_START) { handleCommandFrame(); continue; }
-    // No data / junk byte: keep the USB CLI responsive and keep waiting.
-    serialCommandsPoll();
-  }
-
-  // Read the rest of the command: 4 data + 1 end.
-  if (Serial1.available() >= 5) {
-    uint8_t data[4];
-    Serial1.readBytes(data, 4);
-    uint8_t endMarker = Serial1.read();
-
-    if (endMarker == PKT_END) {
-      int16_t left = (data[0] << 8) | data[1];
-      int16_t right = (data[2] << 8) | data[3];
-      setMotors(left, right);
-      return true;
+void serviceSerial1() {
+  while (Serial1.available() > 0) {
+    uint8_t b = (uint8_t)Serial1.read();
+    switch (rxState) {
+      case RX_IDLE:
+        if (b == PKT_START) {
+          rxState = RX_MOTOR;
+          rxGot = 0;
+        } else if (b == CMD_START) {
+          rxState = RX_CMD_LEN;
+        }
+        break;                                   // stray byte: ignore / resync
+      case RX_MOTOR:
+        rxBuf[rxGot++] = b;
+        if (rxGot == 5) {                         // 4 data bytes + END
+          if (rxBuf[4] == PKT_END) {
+            int16_t left = (int16_t)((rxBuf[0] << 8) | rxBuf[1]);
+            int16_t right = (int16_t)((rxBuf[2] << 8) | rxBuf[3]);
+            setMotors(left, right);
+          }
+          rxState = RX_IDLE;
+        }
+        break;
+      case RX_CMD_LEN:
+        rxCmdLen = b;
+        if (rxCmdLen <= 0 || rxCmdLen > 95) {
+          rxState = RX_IDLE;                       // won't fit the CLI buffer
+        } else {
+          rxGot = 0;
+          rxState = RX_CMD_DATA;
+        }
+        break;
+      case RX_CMD_DATA:
+        rxBuf[rxGot++] = b;
+        if (rxGot == rxCmdLen) rxState = RX_CMD_END;
+        break;
+      case RX_CMD_END:
+        if (b == PKT_END) {
+          rxBuf[rxCmdLen] = '\0';
+          // Same dispatcher as the USB CLI; frames any reply back as 0xAC.
+          serialCommandsProcessLine((char*)rxBuf);
+        }
+        rxState = RX_IDLE;
+        break;
     }
   }
-  return false;
 }
 
 // ===== SEND EXTENDED LDC RESPONSE =====
@@ -292,37 +304,59 @@ void sendLDCResponse(const ldc1101_measurement_t& m, bool crackDetected,
 }
 
 // ===== MAIN LOOP =====
+// Free-running, NOT request/response: motor/CLI commands are applied every loop
+// by serviceSerial1() (so control stays instant), while the sensor read +
+// telemetry stream are paced by the CLI `delay` (reading_delay_ms). This mirrors
+// the ECLAIR scanner's free-running stream and removes the per-sample USB
+// round-trip that throttled the old "send one motor command, wait for one reply"
+// handshake.
 void loop() {
-  // 1. Wait for the PC's motor command and drive the motors.
-  readMotorCommand();
+  // 1. Apply any motor commands / CLI frames the PC has streamed (non-blocking,
+  //    every loop so motor response and CLI dispatch never wait on the pacing).
+  serviceSerial1();
 
   // 2. Service the USB CLI (tuning / calibrate / material memory). Non-blocking.
   serialCommandsPoll();
   serial_command_state_t state = serialCommandsGetState();
   serial_command_config_t config = serialCommandsGetConfig();
 
-  // 3. Read one raw (Rp, L) sample and push it through the detection pipeline.
-  ldc1101_measurement_t m = ldc1101_read(config.sensor_c_f);
-  appendMeasurement(m.Rp_ohms, m.L_uH);
-
-  crack_detection_result_t crackResult = {};
-  bool crackDetected = crackDetectionCheck(&crackResult);
-
-  // 4. Non-blocking crack LED (only after calibration).
   uint32_t now = millis();
-  if (state.rotated && crackDetected) {
-    ledOn();
-    crackLedOffMs = now + kCrackLedHoldMs;
-  } else if (crackLedOffMs && now >= crackLedOffMs) {
-    ledOff();
-    crackLedOffMs = 0;
+
+  // 3. Pace the sensor read + telemetry stream to reading_delay_ms (the CLI
+  //    `delay`). millis() wrap is handled by the unsigned subtraction.
+  if (now - lastSampleMs >= state.reading_delay_ms) {
+    lastSampleMs = now;
+
+    // Read one raw (Rp, L) sample and push it through the detection pipeline.
+    ldc1101_measurement_t m = ldc1101_read(config.sensor_c_f);
+    appendMeasurement(m.Rp_ohms, m.L_uH);
+
+    crack_detection_result_t crackResult = {};
+    bool crackDetected = crackDetectionCheck(&crackResult);
+
+    // Latch the crack LED on (only after calibration); the off-latch below.
+    if (state.rotated && crackDetected) {
+      ledOn();
+      crackLedOffMs = now + kCrackLedHoldMs;
+    }
+
+    // Stream the telemetry packet. Drop it rather than block if the link's TX
+    // buffer is backed up (the PC drains continuously; a dropped sample is
+    // cheaper than stalling the loop).
+    if (Serial1.availableForWrite() >= (int)sizeof(txBuffer)) {
+      sendLDCResponse(m, crackDetected, &crackResult, state);
+    }
+
+    // Optional bench Teleplot on USB (off unless `stream on` was issued).
+    if (state.streaming_enabled) {
+      telemetryEmitSample(now, &state, crackDetected, &crackResult);
+    }
   }
 
-  // 5. Reply to the PC with the extended telemetry packet.
-  sendLDCResponse(m, crackDetected, &crackResult, state);
-
-  // 6. Optional bench Teleplot on USB (off unless `stream on` was issued).
-  if (state.streaming_enabled) {
-    telemetryEmitSample(now, &state, crackDetected, &crackResult);
+  // 4. Crack LED off-latch runs every loop so it expires on time regardless of
+  //    the sample pacing.
+  if (crackLedOffMs && now >= crackLedOffMs) {
+    ledOff();
+    crackLedOffMs = 0;
   }
 }

@@ -9,8 +9,8 @@
 #                                   read-back, HDF5 + camera recording)
 #
 # Unlike the ECLAIR scanner, the burrow-bot is NOT a passive stream: the Platform
-# only answers when polled. So this app owns the 100 Hz request/response loop --
-# every tick it sends a motor command (the joystick's, or 0/0 when idle), then
+# only answers when polled. So this app owns the 100 Hz request/response loop.
+# Every tick, it sends a motor command (the joystick's, or 0/0 when idle), then
 # reads exactly one 27-byte telemetry packet back over the bridge. Those samples
 # feed the same live views the ECLAIR scanner used.
 #
@@ -31,18 +31,19 @@
 # Sections, top to bottom:
 #   1. Configuration        2. Pure helpers (parsing-free: geometry only)
 #   3. CsvLogger            4. SerialComm + LinkManager (binary link)
-#   5. HDF5Recorder         6. JoystickControl        7. Camera
-#   8. ScannerState         9. Runtime objects
-#   10. Qt user interface   11. Control loop + redraw + handlers
+#   5. JoystickControl      6. Camera (disabled by default)
+#   7. ScannerState         8. Runtime objects
+#   9. Qt user interface    10. Control loop + redraw + handlers
 # ---------------------------------------------------------------------------
 
 import csv
 import math
 import os
+import queue
 import struct
+import threading
 import time
 from collections import deque
-from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -52,18 +53,14 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 
-# OpenCV / h5py back the camera + experiment recorder. They are optional: the
-# GUI and the robot link work without a camera attached or recording deps.
+# OpenCV backs the optional camera preview. Experiment data is recorded to CSV
+# via the GUI's "Write to File" toggle (HDF5 recording was removed). The GUI and
+# robot link work without a camera attached.
 try:
     import cv2
 except Exception as exc:                                    # pragma: no cover
     cv2 = None
     print(f"OpenCV unavailable -- camera/video disabled: {exc}")
-try:
-    import h5py
-except Exception as exc:                                    # pragma: no cover
-    h5py = None
-    print(f"h5py unavailable -- HDF5 recording disabled: {exc}")
 
 # pygame backs the Xbox controller. Optional: without it you can still watch
 # telemetry and send CLI commands (the loop just sends a 0/0 motor command).
@@ -88,9 +85,9 @@ BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 # --- Request/response cadence ----------------------------------------------
 HERTZ = 100
 LOOP_INTERVAL = 1.0 / HERTZ
-# Read window for the telemetry reply -- a fraction of the loop so a missed
-# packet still leaves time to keep the cadence. Matches the BBot control code.
-TELEMETRY_TIMEOUT_MS = int(LOOP_INTERVAL * 1000 * 0.8)
+# The Platform free-runs (streams telemetry continuously), so a tick with no new
+# frames is normal -- only warn if the link goes silent this long while connected.
+STALE_TELEMETRY_SEC = 0.5
 
 # --- Packet framing (firmware src/platform/main.cpp) -----------------------
 PKT_START = 0xAA                    # motor command frame + telemetry frame
@@ -109,9 +106,19 @@ CSV_FILE = "bbot_scan.csv"
 RECORDINGS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Recordings")
 os.makedirs(RECORDINGS_FOLDER, exist_ok=True)
 CAMERA_INDEX = 1                    # webcam to record alongside telemetry
+# Camera disabled: cv2 cap.read() blocks the 100 Hz control loop until the next
+# webcam frame (~33 ms at 30 fps) and buffers stale frames, throttling motor
+# commands + telemetry to camera rate. Set True to re-enable preview/recording
+# (and consider moving capture to a background thread before doing so).
+CAMERA_ENABLED = False
 
 # --- Live data buffers -----------------------------------------------------
 MAX_POINTS = 5000                   # ring-buffer length for every sample deque
+# Cap the 3D surface mesh size: the ribbon is rebuilt every redraw, so bounding
+# the vertex count keeps that cost flat regardless of how many samples have
+# accumulated (a full 5000-point rebuild on the GUI thread starved the control
+# loop and made driving bursty). Decimated by stride; the newest point is kept.
+MAX_SURFACE_POINTS = 1200
 
 # --- Plot / readout tuning -------------------------------------------------
 DISPLAY_LAG_POINTS = 1              # skip newest N points to reduce right-edge jitter
@@ -174,6 +181,19 @@ def build_surface_data(x_vals, rp_vals, l_vals):
     if len(x_recent) < 2:
         return None
 
+    # Decimate to a bounded point count so the per-frame mesh rebuild stays cheap
+    # (and never grows with the sample buffer). Stride preserves the ribbon shape;
+    # the newest sample is always kept so the trace head stays live.
+    n_in = len(x_recent)
+    if n_in > MAX_SURFACE_POINTS:
+        stride = int(np.ceil(n_in / MAX_SURFACE_POINTS))
+        idx = np.arange(0, n_in, stride)
+        if idx[-1] != n_in - 1:
+            idx = np.append(idx, n_in - 1)
+        x_recent = x_recent[idx]
+        y_recent = y_recent[idx]
+        z_recent = z_recent[idx]
+
     def normalize_centered(vals):
         # Robust scaling keeps each axis active even when outliers are present.
         p_low = float(np.percentile(vals, 5.0))
@@ -200,22 +220,26 @@ def build_surface_data(x_vals, rp_vals, l_vals):
     vertices[1::2, 1] = y_norm
     vertices[1::2, 2] = z_norm
 
+    # Vectorized faces: two triangles per quad spanning consecutive samples.
+    base = (2 * np.arange(n - 1, dtype=np.uint32))
     faces = np.empty((2 * (n - 1), 3), dtype=np.uint32)
-    for i in range(n - 1):
-        b = 2 * i
-        faces[2 * i] = [b, b + 1, b + 2]
-        faces[2 * i + 1] = [b + 1, b + 3, b + 2]
+    faces[0::2, 0] = base
+    faces[0::2, 1] = base + 1
+    faces[0::2, 2] = base + 2
+    faces[1::2, 0] = base + 1
+    faces[1::2, 1] = base + 3
+    faces[1::2, 2] = base + 2
 
+    # Vectorized face colors: per-quad color from the mean z of its two samples,
+    # repeated across the quad's two triangles.
     z_color = z_norm + 0.5
-
-    face_colors = np.empty((faces.shape[0], 4), dtype=np.float32)
-    for i in range(n - 1):
-        c = float(0.5 * (z_color[i] + z_color[i + 1]))
-        r = 0.1 + 0.9 * c
-        g = 0.5 * (1.0 - c)
-        b = 1.0 - 0.8 * c
-        face_colors[2 * i] = [r, g, b, 0.32]
-        face_colors[2 * i + 1] = [r, g, b, 0.32]
+    c = 0.5 * (z_color[:-1] + z_color[1:])
+    quad_colors = np.empty((n - 1, 4), dtype=np.float32)
+    quad_colors[:, 0] = 0.1 + 0.9 * c
+    quad_colors[:, 1] = 0.5 * (1.0 - c)
+    quad_colors[:, 2] = 1.0 - 0.8 * c
+    quad_colors[:, 3] = 0.32
+    face_colors = np.repeat(quad_colors, 2, axis=0)
 
     line_pos = np.column_stack((x_norm, y_norm, z_norm)).astype(np.float32)
     return vertices, faces, face_colors, line_pos
@@ -336,27 +360,26 @@ class SerialComm:
         packet.append(PKT_END)
         self.ser.write(packet)
 
-    def read_ldc_packet(self, timeout_ms=TELEMETRY_TIMEOUT_MS):
-        """Wait for and return one telemetry frame, or None on timeout.
+    def drain_packets(self):
+        """Non-blocking: return every complete telemetry frame available now.
 
-        Returns ``(ts, motors, rp, l, flags, crack_size)``. NaN Rp/L is returned
-        (not dropped) so a dead/misconfigured sensor stays visible upstream.
-
-        The Platform interleaves CLI reply frames (0xAC) with telemetry frames
-        (0xAA) on the same link, so we demux both here -- reply text is decoded
-        and queued onto ``self.responses`` for the UI; the first telemetry frame
-        is returned.
+        The Platform free-runs (streams telemetry continuously) rather than
+        answering one reply per request, so each call reads whatever bytes have
+        arrived and returns a list of ``(ts, motors, rp, l, flags, crack_size)``
+        tuples, oldest first. CLI reply frames (0xAC) interleaved on the same
+        link are decoded onto ``self.responses``. NaN Rp/L is kept (not dropped)
+        so a dead/misconfigured sensor stays visible upstream. Returns [] when
+        nothing complete is buffered -- never blocks.
         """
-        end_time = time.time() + (timeout_ms / 1000.0)
-        while time.time() < end_time:
-            if self.ser.in_waiting:
-                self.read_buffer += self.ser.read(self.ser.in_waiting)
-
+        if self.ser.in_waiting:
+            self.read_buffer += self.ser.read(self.ser.in_waiting)
+        packets = []
+        while True:
             packet = self._consume_frames()
-            if packet is not None:
-                return packet
-            time.sleep(0.0001)
-        return None
+            if packet is None:
+                break
+            packets.append(packet)
+        return packets
 
     def _consume_frames(self):
         """Parse complete frames from the front of read_buffer, in order.
@@ -486,188 +509,147 @@ class LinkManager:
 
 
 # ---------------------------------------------------------------------------
-# 5. HDF5Recorder — full experiment capture (telemetry synced to video frames)
+# 5. JoystickControl — Xbox driving + button bindings
 # ---------------------------------------------------------------------------
 
-class HDF5Recorder:
-    """Append-growing HDF5 capture of telemetry + per-sample video-frame index."""
+class _ControllerReader(threading.Thread):
+    """Background pygame poller -- owns ALL pygame access.
 
-    def __init__(self, session_folder, camera_fps):
-        if h5py is None:
-            raise RuntimeError("h5py not available")
-        self.h5_path = os.path.join(session_folder, "ldc_data.h5")
-        self.h5_file = h5py.File(self.h5_path, "w")
+    pygame's event pump blocks ~100+ ms per call on this setup (Windows XInput),
+    so it must never run on the GUI thread (it froze typing, redraw, and the
+    control loop). This thread keeps the latest stick axes and queues button-down
+    events; the GUI thread reads them without touching pygame.
+    """
 
-        def _ds(name, shape, maxshape, dtype):
-            return self.h5_file.create_dataset(
-                name, shape, maxshape=maxshape, dtype=dtype,
-                chunks=True, compression="gzip")
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._lock = threading.Lock()
+        self._axis1 = 0.0
+        self._axis3 = 0.0
+        self.buttons = queue.Queue()
+        self.ready = threading.Event()
+        self.failed = False
+        self.name = ""
+        self._running = True
 
-        self.ts_dset = _ds("timestamp", (0,), (None,), "uint64")
-        self.motor_dset = _ds("motors", (0, 2), (None, 2), "int16")
-        self.rp_dset = _ds("rp_ohms", (0,), (None,), "float32")
-        self.l_dset = _ds("inductance_uH", (0,), (None,), "float32")
-        self.crack_dset = _ds("crack_detected", (0,), (None,), "bool")
-        self.crack_size_dset = _ds("crack_size_thou", (0,), (None,), "float32")
-        self.frame_flag_dset = _ds("frame_captured", (0,), (None,), "bool")
-        self.frame_num_dset = _ds("frame_number", (0,), (None,), "int32")
+    def run(self):
+        try:
+            pygame.init()
+            pygame.joystick.init()
+            if pygame.joystick.get_count() == 0:
+                print("No joystick found")
+                self.failed = True
+                self.ready.set()
+                return
+            js = pygame.joystick.Joystick(0)
+            js.init()
+            self.name = js.get_name()
+            print(f"Controller: {self.name}")
+        except Exception as exc:
+            print(f"Joystick init failed: {exc}")
+            self.failed = True
+            self.ready.set()
+            return
 
-        self.h5_file.attrs["start_time"] = time.time()
-        self.h5_file.attrs["sample_rate_hz"] = HERTZ
-        self.h5_file.attrs["camera_fps"] = camera_fps
-        self.sample_count = 0
+        self.ready.set()
+        while self._running:
+            for event in pygame.event.get():        # also pumps; the slow part
+                if event.type == pygame.JOYBUTTONDOWN:
+                    self.buttons.put(event.button)
+            try:
+                a1 = js.get_axis(1)
+                a3 = js.get_axis(3)
+            except Exception:
+                a1 = a3 = 0.0
+            with self._lock:
+                self._axis1 = a1
+                self._axis3 = a3
+            time.sleep(0.005)
 
-    def append(self, ts, motors, rp, l, crack_detected, crack_size,
-               frame_captured, frame_num):
-        idx = self.sample_count
-        for dset, shape in (
-            (self.ts_dset, (idx + 1,)), (self.motor_dset, (idx + 1, 2)),
-            (self.rp_dset, (idx + 1,)), (self.l_dset, (idx + 1,)),
-            (self.crack_dset, (idx + 1,)), (self.crack_size_dset, (idx + 1,)),
-            (self.frame_flag_dset, (idx + 1,)), (self.frame_num_dset, (idx + 1,)),
-        ):
-            dset.resize(shape)
-        self.ts_dset[idx] = ts
-        self.motor_dset[idx] = motors
-        self.rp_dset[idx] = rp
-        self.l_dset[idx] = l
-        self.crack_dset[idx] = crack_detected
-        self.crack_size_dset[idx] = crack_size
-        self.frame_flag_dset[idx] = frame_captured
-        self.frame_num_dset[idx] = frame_num if frame_captured else -1
-        self.sample_count += 1
+    def axes(self):
+        with self._lock:
+            return self._axis1, self._axis3
 
-    def close(self):
-        self.h5_file.attrs["end_time"] = time.time()
-        self.h5_file.attrs["sample_count"] = self.sample_count
-        self.h5_file.close()
-        print(f"\nHDF5 saved: {self.h5_path} ({self.sample_count} samples)")
+    def stop(self):
+        self._running = False
 
-
-# ---------------------------------------------------------------------------
-# 6. JoystickControl — Xbox driving + button bindings
-# ---------------------------------------------------------------------------
 
 class JoystickControl:
-    """Reads an Xbox controller into tank-drive PWM and dispatches button binds.
+    """Xbox controller -> tank-drive PWM + button binds.
 
-    Button handlers reach the GUI through module-level functions (place_marker /
-    reset_view / quit) and queue Platform CLI commands on the shared
-    ``command_queue`` drained by the control loop.
+    All pygame I/O runs on a background _ControllerReader thread (its event pump
+    is ~100 ms/call here and would freeze the GUI). This object stays on the GUI
+    thread: update() turns the latest thread-read axes into PWM instantly, and
+    process_buttons() drains queued presses so their handlers run GUI-side.
+    Button handlers reach the GUI through module-level functions
+    (place_material_marker / reset_view / toggle_csv_recording / request_quit)
+    and queue Platform CLI commands on the shared ``command_queue``.
     """
 
     def __init__(self):
         if pygame is None:
             raise RuntimeError("pygame not available")
-        pygame.init()
-        pygame.joystick.init()
-        if pygame.joystick.get_count() == 0:
+        self._reader = _ControllerReader()
+        self._reader.start()
+        self._reader.ready.wait(timeout=2.0)
+        if self._reader.failed or not self._reader.is_alive():
             raise RuntimeError("No joystick found")
-        self.joystick = pygame.joystick.Joystick(0)
-        self.joystick.init()
-        print(f"Controller: {self.joystick.get_name()}")
 
-        self.left_pwm = 0
-        self.right_pwm = 0
         self.power = 50
         self.polarity = 1
-        self.recording = False
         self.rotated = False                # mirrors device rotation (telemetry flag)
 
-        # HDF5 + video session state.
-        self.h5_recorder = None
-        self.session_folder = None
-
     def update(self):
-        """Process events and return ``(left_pwm, right_pwm)`` tank-drive."""
-        for event in pygame.event.get():
-            if event.type == pygame.JOYBUTTONDOWN:
-                self.handle_button(event)
-        pygame.event.pump()
-
+        """Return ``(left_pwm, right_pwm)`` from the latest (thread-read) axes."""
+        axis1, axis3 = self._reader.axes()
         threshold = 0.1
-        left_y = self.joystick.get_axis(1) * self.polarity
-        right_y = self.joystick.get_axis(3) * self.polarity
+        left_y = axis1 * self.polarity
+        right_y = axis3 * self.polarity
         if abs(left_y) < threshold:
             left_y = 0
         if abs(right_y) < threshold:
             right_y = 0
-        self.left_pwm = int(left_y * 255 * self.power / 100)
-        self.right_pwm = int(right_y * 255 * self.power / 100)
-        return self.left_pwm, self.right_pwm
+        return (int(left_y * 255 * self.power / 100),
+                int(right_y * 255 * self.power / 100))
 
-    def handle_button(self, event):
-        if event.button == 4:               # LB - power down
+    def process_buttons(self):
+        """Drain queued controller presses and run their handlers (GUI thread)."""
+        while True:
+            try:
+                button = self._reader.buttons.get_nowait()
+            except queue.Empty:
+                break
+            self.handle_button(button)
+
+    def handle_button(self, button):
+        if button == 4:                     # LB - power down
             self.power = max(0, self.power - 10)
             print(f"\nPower: {self.power}%")
-        elif event.button == 5:             # RB - power up
+        elif button == 5:                   # RB - power up
             self.power = min(100, self.power + 10)
             print(f"\nPower: {self.power}%")
-        elif event.button == 2:             # B - place material marker
+        elif button == 2:                   # B - place material marker
             place_material_marker()
-        elif event.button == 3:             # A - toggle experiment recording
-            self.toggle_recording()
-        elif event.button == 0:             # X - reset all plots
+        elif button == 3:                   # A - toggle CSV experiment recording
+            toggle_csv_recording()
+        elif button == 0:                   # X - reset all plots
             reset_view()
-        elif event.button == 9:             # L-stick click - on-device calibrate
+        elif button == 9:                   # L-stick click - on-device calibrate
             command_queue.append("calibrate")
             print("\n[cmd] calibrate")
-        elif event.button == 10:            # R-stick click - toggle rotation
+        elif button == 10:                  # R-stick click - toggle rotation
             self.rotated = not self.rotated
             command_queue.append("rotated on" if self.rotated else "rotated off")
             print(f"\n[cmd] rotated {'on' if self.rotated else 'off'}")
-        elif event.button == 8:             # Back/View - quit
+        elif button == 8:                   # Back/View - quit
             request_quit()
 
-    def toggle_recording(self):
-        self.recording = not self.recording
-        if self.recording:
-            self.start_recording()
-        else:
-            self.stop_recording()
-
-    def start_recording(self):
-        global video_out, current_video_path
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_folder = os.path.join(RECORDINGS_FOLDER, f"session_{timestamp}")
-        os.makedirs(self.session_folder, exist_ok=True)
-        try:
-            self.h5_recorder = HDF5Recorder(self.session_folder, camera_fps)
-        except Exception as exc:
-            print(f"\nHDF5 recorder failed ({exc}) -- recording telemetry skipped")
-            self.h5_recorder = None
-        if cv2 is not None and camera_ok:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
-            current_video_path = os.path.join(self.session_folder, "video.mp4")
-            video_out = cv2.VideoWriter(current_video_path, fourcc, camera_fps,
-                                        (camera_width, camera_height))
-        print(f"\nRECORDING started - {os.path.basename(self.session_folder)}")
-
-    def stop_recording(self):
-        global video_out, current_video_path
-        if self.h5_recorder is not None:
-            self.h5_recorder.close()
-            self.h5_recorder = None
-        if video_out is not None:
-            video_out.release()
-            video_out = None
-            if current_video_path and os.path.exists(current_video_path):
-                size_mb = os.path.getsize(current_video_path) / (1024 * 1024)
-                print(f"   Video saved: {os.path.basename(current_video_path)} ({size_mb:.1f} MB)")
-            current_video_path = None
-        print("\nRECORDING stopped")
-        self.session_folder = None
-
-    def log_data(self, ts, motors, rp, l, crack_detected, crack_size, frame_info):
-        if self.recording and self.h5_recorder is not None:
-            frame_captured = frame_info is not None
-            frame_num = frame_info[1] if frame_info else -1
-            self.h5_recorder.append(ts, motors, rp, l, crack_detected, crack_size,
-                                    frame_captured, frame_num)
+    def stop(self):
+        self._reader.stop()
 
 
 # ---------------------------------------------------------------------------
-# 7. Camera — optional webcam preview + recording source
+# 6. Camera — optional webcam preview (disabled by default)
 # ---------------------------------------------------------------------------
 
 cap = None
@@ -679,7 +661,7 @@ video_out = None
 current_video_path = None
 frame_counter = 0
 
-if cv2 is not None:
+if CAMERA_ENABLED and cv2 is not None:
     try:
         cap = cv2.VideoCapture(CAMERA_INDEX)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
@@ -697,6 +679,9 @@ if cv2 is not None:
         print(f"Camera init failed: {exc}")
         cap = None
         camera_ok = False
+else:
+    print("Camera disabled (CAMERA_ENABLED=False) -- preview/recording off, "
+          "control loop runs at full rate")
 
 
 def grab_camera_frame(record):
@@ -719,7 +704,7 @@ def grab_camera_frame(record):
 
 
 # ---------------------------------------------------------------------------
-# 8. ScannerState — live sample buffers + readout text
+# 7. ScannerState — live sample buffers + readout text
 # ---------------------------------------------------------------------------
 
 class ScannerState:
@@ -752,6 +737,7 @@ class ScannerState:
         self.good_count = 0
         self.nan_count = 0
         self.timeout_count = 0
+        self.last_packet_monotonic = time.monotonic()   # for stream-stall detection
 
         # View tracking.
         self.xy_start_index = 0
@@ -811,7 +797,7 @@ class ScannerState:
 
 
 # ---------------------------------------------------------------------------
-# 9. Runtime objects
+# 8. Runtime objects
 # ---------------------------------------------------------------------------
 
 link = LinkManager(BAUDRATE)
@@ -831,7 +817,7 @@ if pygame is not None:
 
 
 # ---------------------------------------------------------------------------
-# 10. Qt user interface
+# 9. Qt user interface
 # ---------------------------------------------------------------------------
 
 # High-DPI rounding (Qt6 enables HiDPI automatically; just set rounding policy).
@@ -1014,10 +1000,15 @@ bottom_axis.toggled.connect(toggle_right_x_mode)
 
 initial_xy_view_state = plot_xy.getViewBox().getState(copy=True)
 xy_curve = plot_xy.plot(pen=pg.mkPen("r", width=scale_line_width(1.0, RIGHT_PLOT_MAIN_LINE_WIDTH_PERCENT)))
+# Pre-build the red->white gradient pens once; the per-segment shade is fixed by
+# index, so the redraw only needs setData() (no per-frame mkPen on ~100 curves).
 recent_segment_curves = []
-for _ in range(max(RECENT_FADE_POINTS - 1, 0)):
+_seg_total = max(RECENT_FADE_POINTS - 1, 0)
+_seg_width = scale_line_width(3.0, RIGHT_PLOT_RECENT_LINE_WIDTH_PERCENT)
+for _i in range(_seg_total):
+    _shade = int(255 * _i / max(_seg_total - 1, 1))      # red (oldest) -> white (newest)
     recent_segment_curves.append(
-        plot_xy.plot(pen=pg.mkPen((255, 0, 0), width=scale_line_width(3.0, RIGHT_PLOT_RECENT_LINE_WIDTH_PERCENT)))
+        plot_xy.plot(pen=pg.mkPen((255, _shade, _shade, 255), width=_seg_width))
     )
 
 # Persistent overlay markers on the phase plot (material labels + crack X's).
@@ -1361,7 +1352,7 @@ controls_overlay.raise_()
 
 
 # ---------------------------------------------------------------------------
-# 11. Control loop + redraw + handlers
+# 10. Control loop + redraw + handlers
 # ---------------------------------------------------------------------------
 
 def place_material_marker():
@@ -1411,6 +1402,11 @@ def request_quit():
         except Exception:
             pass
     app.quit()
+
+
+def toggle_csv_recording():
+    """Flip the GUI's CSV "Write to File" toggle (bound to the controller A button)."""
+    write_toggle_button.setChecked(not write_toggle_button.isChecked())
 
 
 def keyPressEvent(event):
@@ -1480,23 +1476,59 @@ def update_raw_readout(rp, l, flags, crack_size):
     )
 
 
-def control_tick():
-    """One request/response cycle: drive -> command -> read one telemetry frame.
+# --- TEMP perf instrumentation (remove once the bottleneck is found) ---------
+# Accumulates wall-clock time per labelled section and prints avg/max every 2 s.
+# Tells us whether the cost is serial I/O to the bridge (ser_write/ser_drain),
+# the joystick read, or the rendering (redraw) -- without guessing.
+_PERF = {}
+_perf_last_report = [time.monotonic()]
 
-    Single-threaded with the redraw (separate, slower timer). The robot only
-    answers when polled, so we always send a motor command -- the joystick's, or
-    0/0 when idle -- which also keeps data flowing for stationary calibration.
+
+def _perf_add(name, dt):
+    s = _PERF.setdefault(name, [0.0, 0, 0.0])
+    s[0] += dt
+    s[1] += 1
+    if dt > s[2]:
+        s[2] = dt
+    now = time.monotonic()
+    if now - _perf_last_report[0] >= 2.0:
+        parts = []
+        for k in sorted(_PERF):
+            tot, cnt, mx = _PERF[k]
+            if cnt:
+                parts.append(f"{k}: avg={tot / cnt * 1e3:.2f}ms max={mx * 1e3:.2f}ms n={cnt}")
+            _PERF[k] = [0.0, 0, 0.0]
+        print("[perf] " + " | ".join(parts))
+        _perf_last_report[0] = now
+
+
+def _timed(name, fn, *args):
+    t0 = time.perf_counter()
+    try:
+        return fn(*args)
+    finally:
+        _perf_add(name, time.perf_counter() - t0)
+
+
+def control_tick():
+    """Push the latest motor command and drain all streamed telemetry.
+
+    Free-running (NOT request/response): the Platform streams telemetry
+    continuously, so we send motor/CLI commands fire-and-forget and drain
+    whatever frames have arrived without ever blocking on a reply. This is what
+    keeps both control and data real-time -- mirrors the ECLAIR scanner's
+    free-running stream. Single-threaded with the redraw (separate, slower
+    timer), but this tick no longer blocks, so a heavy redraw can't stall it.
     """
     if state.paused or not link.is_connected:
         return
 
     # Joystick -> motor PWM (0/0 when no controller is attached).
     left = right = 0
-    recording = False
     if joystick is not None:
         try:
-            left, right = joystick.update()
-            recording = joystick.recording
+            left, right = _timed("joystick", joystick.update)
+            joystick.process_buttons()      # run queued button binds on this thread
         except Exception as exc:
             print(f"\nJoystick read failed: {exc}")
 
@@ -1510,34 +1542,47 @@ def control_tick():
                 return
         command_queue.clear()
 
-    # Motor command (left inverted to match wiring, as in the BBot control code).
+    # Motor command, fire-and-forget (left inverted to match wiring). No reply.
     try:
-        link.comm.send_motor_command(left * -1, right)
+        _timed("ser_write", link.comm.send_motor_command, left * -1, right)
     except serial.SerialException:
         link.disconnect("device lost")
         return
 
-    frame_info = grab_camera_frame(record=recording)
+    # Drain every telemetry frame streamed since the last tick (non-blocking).
+    packets = _timed("ser_drain", link.comm.drain_packets)
 
-    packet = link.comm.read_ldc_packet(TELEMETRY_TIMEOUT_MS)
-
-    # Show any Platform CLI replies that arrived this tick (status/help/OK/ERR...).
+    # Show any Platform CLI replies that arrived (status/help/OK/ERR...).
     for line in link.comm.drain_responses():
         append_serial_response(line)
 
-    if packet is None:
-        state.timeout_count += 1
-        append_incoming_line(
-            f"[--] no telemetry (timeout)  good={state.good_count} "
-            f"nan={state.nan_count} to={state.timeout_count}"
-        )
+    if not packets:
+        # No data this tick is normal at the stream cadence; only flag a true
+        # stall (link alive but silent for a while).
+        if time.monotonic() - state.last_packet_monotonic > STALE_TELEMETRY_SEC:
+            state.timeout_count += 1
+            state.last_packet_monotonic = time.monotonic()   # rate-limit the warning
+            append_incoming_line(
+                f"[--] no telemetry for >{STALE_TELEMETRY_SEC:.1f}s  "
+                f"good={state.good_count} nan={state.nan_count} to={state.timeout_count}"
+            )
         return
 
-    ts, motors, rp, l, flags, crack_size = packet
+    state.last_packet_monotonic = time.monotonic()
+    for packet in packets:
+        process_packet(packet)
+
+    # Refresh the rolling raw readout once per tick (newest frame) to bound cost.
+    _ts, _motors, rp, l, flags, crack_size = packets[-1]
     update_raw_readout(rp, l, flags, crack_size)
 
+
+def process_packet(packet):
+    """Ingest one telemetry frame into the live buffers / crack events / CSV."""
+    ts, motors, rp, l, flags, crack_size = packet
+
     if not (math.isfinite(rp) and math.isfinite(l)):
-        state.nan_count += 1                # packet arrived but sensor read failed
+        state.nan_count += 1                # frame arrived but sensor read failed
         return
 
     state.good_count += 1
@@ -1566,10 +1611,6 @@ def control_tick():
         serial_out, response = state.consume_pending_command_exchange()
         csv_logger.write_sample(ts, rp, l, crack_detected, crack_size, calibrated,
                                 serial_out, response)
-
-    # HDF5 + video experiment recording (A button).
-    if joystick is not None:
-        joystick.log_data(ts, motors, rp, l, crack_detected, crack_size, frame_info)
 
 
 def update():
@@ -1680,13 +1721,11 @@ def update():
     if tail_count > 1:
         tail_x = x_right[-tail_count:]
         tail_y = y_right[-tail_count:]
-        seg_count = tail_count - 1
-        shades = np.linspace(0, 255, seg_count).astype(int)
+        seg_count = min(tail_count - 1, len(recent_segment_curves))
+        # Pens are pre-built (fixed gradient); only push new segment endpoints.
         for i in range(seg_count):
-            seg_curve = recent_segment_curves[i]
-            seg_curve.setPen(pg.mkPen((255, int(shades[i]), int(shades[i]), 255),
-                                      width=scale_line_width(3.0, RIGHT_PLOT_RECENT_LINE_WIDTH_PERCENT)))
-            seg_curve.setData([tail_x[i], tail_x[i + 1]], [tail_y[i], tail_y[i + 1]])
+            recent_segment_curves[i].setData([tail_x[i], tail_x[i + 1]],
+                                             [tail_y[i], tail_y[i + 1]])
         for i in range(seg_count, len(recent_segment_curves)):
             recent_segment_curves[i].setData([], [])
     else:
@@ -1694,20 +1733,21 @@ def update():
             seg_curve.setData([], [])
 
 
-# Fast control loop (request/response) + slower redraw, both on the GUI thread.
+# Fast control loop (motor send + non-blocking telemetry drain) + slower redraw,
+# both on the GUI thread, so the redraw is kept cheap to avoid starving control.
 control_timer = QtCore.QTimer()
 control_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-control_timer.timeout.connect(control_tick)
+control_timer.timeout.connect(lambda: _timed("control_total", control_tick))  # TEMP perf
 control_timer.start(int(LOOP_INTERVAL * 1000))      # ~100 Hz
 
 redraw_timer = QtCore.QTimer()
-redraw_timer.timeout.connect(update)
+redraw_timer.timeout.connect(lambda: _timed("redraw_total", update))          # TEMP perf
 redraw_timer.start(50)                               # ~20 fps
 
 
 def close_resources():
-    if joystick is not None and joystick.recording:
-        joystick.stop_recording()
+    if joystick is not None:
+        joystick.stop()
     if link.is_connected:
         try:
             link.comm.send_motor_command(0, 0)
@@ -1731,11 +1771,11 @@ app.aboutToQuit.connect(close_resources)
 
 def main():
     print("=" * 64)
-    print(f"BBot LDC Scanner - {HERTZ} Hz request/response")
+    print(f"BBot LDC Scanner - free-running stream, motor cmds at {HERTZ} Hz")
     print("=" * 64)
     print("Connect the bridge link (lower-right), then drive / configure:")
     print("  Left Stick: left motor      Right Stick: right motor")
-    print("  LB/RB: power -/+            A: record (HDF5+video)   B: material marker")
+    print("  LB/RB: power -/+            A: toggle CSV write      B: material marker")
     print("  X / Space: reset plots      L-click: calibrate       R-click: toggle rotation")
     print("  Back/View: quit             P: pause   F: CSV write   1/2/3: 3D views")
     print("  Click the phase-plot x-axis to toggle R_p <-> Time; crack-plot y-axis for size <-> mag")

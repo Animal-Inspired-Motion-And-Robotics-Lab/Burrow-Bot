@@ -14,19 +14,24 @@ ECLAIR pipeline was migrated here in 2026-06 (see "LDC pipeline integration").
 ```
  PC (pc_control, Python)  <--USB-->  Bridge ESP32  <--UART-->  Platform ESP32
    joystick + plotting +              transparent              motors + LDC1101 +
-   HDF5/video recording               byte forwarder           crack pipeline
+   CSV recording                      byte forwarder           crack pipeline
 ```
 
-- **PC** — `pc_control/AAA Opt BBot Control Code.py`. Pygame joystick → motor
-  commands at 100 Hz; reads back telemetry; pyqtgraph plots (time series + Rp/L
-  phase-space scatter); records HDF5 + camera video. Request/response: send one
-  motor packet, wait for one telemetry packet.
+- **PC** — `pc_control/BBot LDC Scanner.py` (the active GUI; `AAA Opt BBot
+  Control Code.py` is the older, still-request/response variant). Pygame
+  joystick → motor commands at 100 Hz; pyqtgraph plots (3D Rp/L/t surface +
+  phase-space scatter); records to CSV. **Free-running, not request/response:**
+  motor/CLI commands go out fire-and-forget and telemetry is drained
+  continuously and non-blocking — no per-sample handshake. (The old
+  send-one-wait-for-one model serialized every sample behind a USB round-trip
+  and was the source of the control/telemetry lag.)
 - **Bridge** — `src/bridge/main.cpp`. A XIAO ESP32-S3 that forwards every byte
   USB↔UART in both directions, unframed. **Protocol-agnostic — never needs to
   change when the packet format changes.**
-- **Platform** — `src/platform/main.cpp` + the pipeline modules. The
-  responder: waits for a motor command, drives the DRV8835 motors, reads the
-  LDC1101, runs the crack pipeline, replies with a telemetry packet.
+- **Platform** — `src/platform/main.cpp` + the pipeline modules. Free-running:
+  `loop()` reads the LDC1101, runs the crack pipeline, and streams a telemetry
+  packet every iteration, while `serviceSerial1()` applies streamed motor
+  commands and dispatches CLI frames asynchronously (non-blocking).
 
 ## Build & flash (PlatformIO)
 
@@ -44,8 +49,9 @@ Both boards are `seeed_xiao_esp32s3`, Arduino framework. `build_src_filter`
 splits the two firmwares: `+<platform/*>` vs `+<bridge/*>`, so the pipeline
 sources under `src/platform/` only compile into the Platform build.
 
-`pc_control` deps are in `requirements.txt` (pyserial, pygame, opencv, h5py,
-numpy, pyqtgraph).
+`pc_control` deps are in `requirements.txt` (pyserial, pygame, opencv, numpy,
+pyqtgraph). Experiment data records to CSV via the GUI's "Write to File" toggle
+(also bound to the controller A button); HDF5/video recording was removed.
 
 ## Telemetry packet (Platform → PC, little-endian, 27 bytes)
 
@@ -68,12 +74,12 @@ Motor command (PC → Platform): 6 bytes
 `[0xAA][L i16 big-endian][R i16 big-endian][0x55]`.
 
 CLI command frame (PC → Platform): `[0xAB][len u8][len ASCII bytes][0x55]`. The
-Platform recognizes `0xAB` in `readMotorCommand()`'s wait loop and feeds the text
-to `serialCommandsProcessLine()` — the **same dispatcher as the USB CLI**, so any
-CLI command works (`calibrate`, `rotated on|off`, `save <name>`, `crack_*`, ...).
-Command frames get no telemetry reply. PC side: `SerialComm.send_command(text)`;
-joystick buttons enqueue into `JoystickControl.pending_commands`, drained each
-loop.
+Platform parses `0xAB` frames in `serviceSerial1()`'s state machine and feeds the
+text to `serialCommandsProcessLine()` — the **same dispatcher as the USB CLI**, so
+any CLI command works (`calibrate`, `rotated on|off`, `save <name>`, `crack_*`, ...).
+Command frames get no telemetry reply (the reply text streams back as 0xAC frames;
+see below). PC side: `SerialComm.send_command(text)`; joystick buttons enqueue into
+the shared `command_queue`, drained each control tick.
 
 CLI reply frame (Platform → PC): `[0xAC][len u8][len ASCII bytes][0x55]`, one per
 output line. The CLI dispatcher and its helpers (`serial_commands`,
@@ -95,7 +101,9 @@ buffer size + END index together.
 
 ## On-device LDC pipeline (`src/platform/`, ported from ECLAIR)
 
-Per-tick chain, one sample per PC request (PC paces the ~100 Hz cadence):
+Per-loop chain (free-running — the Platform streams one sample per tick, paced by
+the CLI `delay` / `reading_delay_ms`, default 25 ms = 40 Hz; the PC drains
+continuously):
 
 ```
 ldc1101_read()        raw (Rp, L)
@@ -132,9 +140,9 @@ conflict entirely:
 
 ## Calibration workflow (operator, over USB)
 
-Cracks are only flagged **after calibration** (flags bit1). To calibrate a
-substrate: connect USB to the Platform, ensure the PC control app is running
-(data must be flowing — the pipeline only advances on motor requests), then over
+Cracks are only flagged **after calibration** (flags bit1). The pipeline now
+free-runs (advances every Platform loop regardless of PC traffic), so calibration
+only needs the sensor over the substrate — connect USB to the Platform, then over
 the USB serial CLI: `calibrate` → optionally `save <material>` / `retrieve
 <material>` / `materials`. `help` / `status` list everything.
 
@@ -158,7 +166,7 @@ the actual Platform wiring before flashing.**
 - USB-CDC `Serial` can stall if it writes faster than a host reads, so Teleplot
   (`streaming_enabled`) defaults **off**; enable with `stream on` when tethered.
 - Crack indication is a non-blocking LED latch (not the ECLAIR blocking
-  `ledFlash`), to keep the 100 Hz response loop from missing PC requests.
+  `ledFlash`), to keep the free-running loop streaming telemetry at full rate.
 - `reference-eclair-ldc/` (with `INTEGRATION.md`) and `lib-updated-ldc1101/` are
   source-of-truth scaffolding the integration was copied from; not part of the
   build.

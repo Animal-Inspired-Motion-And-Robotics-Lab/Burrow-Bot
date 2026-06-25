@@ -5,7 +5,6 @@ filelock==3.24.3
 fonttools==4.61.1
 fsspec==2026.2.0
 future==1.0.0
-h5py==3.16.0
 iniconfig==2.3.0
 iso8601==2.1.0
 Jinja2==3.1.6
