@@ -40,3 +40,6 @@ tzdata==2025.3
 # These pins target Python 3.12 (the pins above also resolve there).
 pyqtgraph==0.13.7
 PyQt6==6.7.1
+# PyOpenGL backs pyqtgraph.opengl, used for the live 3D R_p/L/t surface in the
+# BBot LDC Scanner GUI (`from pyqtgraph.opengl import ...`).
+PyOpenGL==3.1.10
