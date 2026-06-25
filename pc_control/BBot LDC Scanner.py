@@ -529,7 +529,9 @@ class _ControllerReader(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self._lock = threading.Lock()
+        self._axis0 = 0.0
         self._axis1 = 0.0
+        self._axis2 = 0.0
         self._axis3 = 0.0
         self.buttons = queue.Queue()
         self.ready = threading.Event()
@@ -579,12 +581,16 @@ class _ControllerReader(threading.Thread):
                 if event.type == pygame.JOYBUTTONDOWN:
                     self.buttons.put(event.button)
             try:
+                a0 = js.get_axis(0)
                 a1 = js.get_axis(1)
+                a2 = js.get_axis(2)
                 a3 = js.get_axis(3)
             except Exception:
-                a1 = a3 = 0.0
+                a0 = a1 = a2 = a3 = 0.0
             with self._lock:
+                self._axis0 = a0
                 self._axis1 = a1
+                self._axis2 = a2
                 self._axis3 = a3
             now = time.monotonic()
             if now - last_report >= 2.0 and pump_cnt:
@@ -600,8 +606,20 @@ class _ControllerReader(threading.Thread):
         with self._lock:
             return self._axis1, self._axis3
 
+    def all_axes(self):
+        """Return all four stick axes (LX, LY, RX, RY) for view-mode control."""
+        with self._lock:
+            return self._axis0, self._axis1, self._axis2, self._axis3
+
     def stop(self):
         self._running = False
+
+
+# Controller button index that toggles robot-drive vs. 3D-view control. On this
+# controller that's the START button (index 9). The mapping is nonstandard
+# (X=0, A=1, B=2, Y=3, Back/View=8); any unmapped press is logged with its index
+# in handle_button() so this can be re-derived if the controller changes.
+MODE_BUTTON = 9
 
 
 class JoystickControl:
@@ -628,6 +646,7 @@ class JoystickControl:
         self.power = 50
         self.polarity = 1
         self.rotated = False                # mirrors device rotation (telemetry flag)
+        self.view_mode = False              # MODE: sticks orbit the 3D view, robot held still
 
     def update(self):
         """Return ``(left_pwm, right_pwm)`` from the latest (thread-read) axes."""
@@ -641,6 +660,30 @@ class JoystickControl:
             right_y = 0
         return (int(left_y * 255 * self.power / 100),
                 int(right_y * 255 * self.power / 100))
+
+    def update_view(self):
+        """Orbit/zoom the 3D surface plot from the sticks (MODE view mode).
+
+        Left stick orbits the camera (X -> azimuth, Y -> elevation); right stick
+        Y zooms (changes camera distance). The robot is held still while here --
+        control_tick sends 0/0 motor commands in view mode.
+        """
+        ax0, ax1, _ax2, ax3 = self._reader.all_axes()
+        dead = 0.15
+
+        def dz(v):
+            return 0.0 if abs(v) < dead else v
+
+        azim = dz(ax0)                      # left stick X -> orbit horizontally
+        elev = dz(ax1)                      # left stick Y -> orbit vertically
+        zoom = dz(ax3)                      # right stick Y -> dolly in/out
+        if azim or elev:
+            # Per-tick degrees; control_tick runs at the control cadence.
+            surface_view.orbit(-azim * 4.0, elev * 4.0)
+        if zoom:
+            dist = surface_view.opts["distance"] * (1.0 + zoom * 0.04)
+            surface_view.opts["distance"] = max(0.5, min(20.0, dist))
+            surface_view.update()
 
     def process_buttons(self):
         """Drain queued controller presses and run their handlers (GUI thread)."""
@@ -676,6 +719,13 @@ class JoystickControl:
             reset_view()
         elif button == 8:                   # Back/View - quit
             request_quit()
+        elif button == MODE_BUTTON:         # START/MODE - toggle robot drive <-> 3D view control
+            self.view_mode = not self.view_mode
+            set_mode_indicator(self.view_mode)
+            print(f"\n[mode] {'3D VIEW control' if self.view_mode else 'ROBOT drive'}")
+        else:
+            # Unmapped button: log its index so MODE_BUTTON can be confirmed/set.
+            print(f"\n[btn] unmapped button {button}")
 
     def stop(self):
         self._reader.stop()
@@ -969,7 +1019,8 @@ controls_overlay.setText(
     "LB / RB: power - / +\n"
     "A: CSV write   B: material marker\n"
     "X: calibrate   Y: toggle rotation\n"
-    "L-click: reset plots   R-click: vibrate   Back/View: quit"
+    "L-click: reset plots   R-click: vibrate   Back/View: quit\n"
+    "MODE: toggle robot drive <-> 3D view (sticks orbit/zoom)"
 )
 controls_overlay.setStyleSheet(
     "color: rgba(200, 200, 200, 150); font-size: 14px; background: transparent;"
@@ -977,12 +1028,36 @@ controls_overlay.setStyleSheet(
 controls_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 controls_overlay.adjustSize()
 
+# Prominent current-mode banner pinned to the 3D view's top-left. Makes it
+# obvious whether the sticks drive the robot or orbit the plot, so it's never a
+# mystery why the robot "won't drive" (START toggles between the two).
+mode_overlay = QtWidgets.QLabel(surface_view)
+mode_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+
+def set_mode_indicator(view_mode):
+    """Update the top-left banner to reflect drive vs. 3D-view mode."""
+    if view_mode:
+        mode_overlay.setText("3D VIEW MODE")
+        color = "rgba(255, 180, 40, 200)"      # amber: robot is held still
+    else:
+        mode_overlay.setText("DRIVE MODE")
+        color = "rgba(90, 210, 90, 200)"       # green: driving
+    mode_overlay.setStyleSheet(
+        f"color: {color}; font-size: 13px; font-weight: bold; background: transparent;"
+    )
+    mode_overlay.adjustSize()
+
+
+set_mode_indicator(False)
+
 
 def _position_controls_overlay():
     """Keep the cheat sheet anchored to the 3D view's lower-left corner."""
     margin = 6
     controls_overlay.adjustSize()
     controls_overlay.move(margin, surface_view.height() - controls_overlay.height() - margin)
+    mode_overlay.move(margin, margin)
 
 
 # Reposition on resize without clobbering GLViewWidget's own GL viewport handling.
@@ -1530,17 +1605,23 @@ def control_tick():
     free-running stream. Single-threaded with the redraw (separate, slower
     timer), but this tick no longer blocks, so a heavy redraw can't stall it.
     """
-    if state.paused or not link.is_connected:
-        return
-
-    # Joystick -> motor PWM (0/0 when no controller is attached).
+    # Controller buttons + 3D-view orbit run even when paused/disconnected: the
+    # MODE toggle, its discovery log, and view control don't need the robot link
+    # (only motor/CLI sends below do). In MODE view mode the sticks orbit the 3D
+    # plot instead of driving, and the robot is held still.
     left = right = 0
     if joystick is not None:
         try:
-            left, right = joystick.update()
+            if joystick.view_mode:
+                joystick.update_view()      # sticks orbit/zoom the 3D camera
+            else:
+                left, right = joystick.update()
             joystick.process_buttons()      # run queued button binds on this thread
         except Exception as exc:
             print(f"\nJoystick read failed: {exc}")
+
+    if state.paused or not link.is_connected:
+        return
 
     # Drain queued Platform CLI commands (console + button binds).
     if command_queue:
