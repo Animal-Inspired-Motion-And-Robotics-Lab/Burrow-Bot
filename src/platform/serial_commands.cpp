@@ -565,7 +565,8 @@ void processCommand(char* line) {
       }
       sampleCount = (size_t)parsed;
     }
-    ledFlash(10, 30);
+    // No blocking ledFlash here: it would freeze loop() ~600 ms, and during a
+    // `vibrate` burst that holds the motors in one phase (= a sustained drive).
     Reply.print("calibrate start samples=");
     Reply.println((unsigned int)sampleCount);
     calibration_result_t result = calibrationRun(gConfig.sensor_c_f, sampleCount);
@@ -591,7 +592,8 @@ void processCommand(char* line) {
       }
       sampleCount = (size_t)parsed;
     }
-    ledFlash(10, 30);
+    // No blocking ledFlash here (see `calibrate`): a ~600 ms freeze during a
+    // `vibrate` burst would hold the motors in one phase and drive the robot.
     Reply.print("baseline start samples=");
     Reply.println((unsigned int)sampleCount);
     baseline_result_t result = baselineRun(sampleCount);

@@ -92,9 +92,12 @@ command output is framed, not the high-rate stream.) The PC demuxes `0xAA`
 telemetry and `0xAC` reply frames from the one stream in
 `SerialComm._consume_frames()`; reply lines queue onto `SerialComm.responses`,
 drained each `control_tick` into the GUI's Platform-CLI transcript. Replies are
-**not** synchronous — they appear a tick or two after the command. Stick-clicks are bound: **L-click = `calibrate`, R-click = toggle
-`rotated`** (toggle state synced from telemetry flag bit1). Note `calibrate`
-blocks the Platform ~600 ms (its `ledFlash`), so do it stationary.
+**not** synchronous — they appear a tick or two after the command. Controller
+binds (PC `JoystickControl.handle_button`): **X = `calibrate`, Y = toggle
+`rotated`, A = CSV write, B = material marker, L-click = reset plots, R-click =
+`vibrate`** (rotate toggle synced from telemetry flag bit1). `calibrate`/`baseline`
+no longer block (the `ledFlash` was removed) so they're safe to issue mid-`vibrate`;
+a ~600 ms block there would freeze the vibrate mid-phase and drive the robot.
 
 To add a telemetry field: append before END, bump `RESP_LEN` and the firmware
 buffer size + END index together.
