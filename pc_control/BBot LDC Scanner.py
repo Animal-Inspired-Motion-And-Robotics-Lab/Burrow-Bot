@@ -114,11 +114,11 @@ CAMERA_ENABLED = False
 
 # --- Live data buffers -----------------------------------------------------
 MAX_POINTS = 5000                   # ring-buffer length for every sample deque
-# Cap the 3D surface mesh size: the ribbon is rebuilt every redraw, so bounding
-# the vertex count keeps that cost flat regardless of how many samples have
-# accumulated (a full 5000-point rebuild on the GUI thread starved the control
-# loop and made driving bursty). Decimated by stride; the newest point is kept.
-MAX_SURFACE_POINTS = 1200
+# Cap the 3D surface mesh to the most recent N samples (a sliding window). This
+# bounds the per-frame rebuild cost AND stays smooth: the vertex set only changes
+# by the newest/oldest sample each frame, so the ribbon flows instead of jittering
+# (stride-decimation re-picked different points every frame and made it shimmer).
+MAX_SURFACE_POINTS = 2500
 
 # --- Plot / readout tuning -------------------------------------------------
 DISPLAY_LAG_POINTS = 1              # skip newest N points to reduce right-edge jitter
@@ -181,18 +181,13 @@ def build_surface_data(x_vals, rp_vals, l_vals):
     if len(x_recent) < 2:
         return None
 
-    # Decimate to a bounded point count so the per-frame mesh rebuild stays cheap
-    # (and never grows with the sample buffer). Stride preserves the ribbon shape;
-    # the newest sample is always kept so the trace head stays live.
-    n_in = len(x_recent)
-    if n_in > MAX_SURFACE_POINTS:
-        stride = int(np.ceil(n_in / MAX_SURFACE_POINTS))
-        idx = np.arange(0, n_in, stride)
-        if idx[-1] != n_in - 1:
-            idx = np.append(idx, n_in - 1)
-        x_recent = x_recent[idx]
-        y_recent = y_recent[idx]
-        z_recent = z_recent[idx]
+    # Keep a sliding window of the most recent samples. Unlike stride decimation,
+    # the set of plotted points shifts by only one sample per new reading, so the
+    # ribbon (and its robust normalization) flows smoothly instead of jittering.
+    if len(x_recent) > MAX_SURFACE_POINTS:
+        x_recent = x_recent[-MAX_SURFACE_POINTS:]
+        y_recent = y_recent[-MAX_SURFACE_POINTS:]
+        z_recent = z_recent[-MAX_SURFACE_POINTS:]
 
     def normalize_centered(vals):
         # Robust scaling keeps each axis active even when outliers are present.
@@ -557,20 +552,8 @@ class _ControllerReader(threading.Thread):
             return
 
         self.ready.set()
-        # TEMP perf: report the pump cost so we can see if the hints sped it up.
-        pump_sum = 0.0
-        pump_cnt = 0
-        pump_max = 0.0
-        last_report = time.monotonic()
         while self._running:
-            t0 = time.perf_counter()
-            events = pygame.event.get()             # also pumps; the slow part
-            dt = time.perf_counter() - t0
-            pump_sum += dt
-            pump_cnt += 1
-            pump_max = max(pump_max, dt)
-
-            for event in events:
+            for event in pygame.event.get():        # also pumps; the slow part
                 if event.type == pygame.JOYBUTTONDOWN:
                     self.buttons.put(event.button)
             try:
@@ -581,16 +564,6 @@ class _ControllerReader(threading.Thread):
             with self._lock:
                 self._axis1 = a1
                 self._axis3 = a3
-
-            now = time.monotonic()
-            if now - last_report >= 2.0 and pump_cnt:
-                print(f"[perf] js_pump(thread): avg={pump_sum / pump_cnt * 1e3:.1f}ms "
-                      f"max={pump_max * 1e3:.1f}ms n={pump_cnt}")
-                pump_sum = 0.0
-                pump_cnt = 0
-                pump_max = 0.0
-                last_report = now
-
             time.sleep(0.005)
 
     def axes(self):
@@ -657,17 +630,17 @@ class JoystickControl:
             print(f"\nPower: {self.power}%")
         elif button == 2:                   # B - place material marker
             place_material_marker()
-        elif button == 3:                   # A - toggle CSV experiment recording
+        elif button == 1:                   # A - turn on CSV write
             toggle_csv_recording()
-        elif button == 0:                   # X - reset all plots
-            reset_view()
-        elif button == 9:                   # L-stick click - on-device calibrate
+        elif button == 0:                   # X - send `calibrate`
             command_queue.append("calibrate")
             print("\n[cmd] calibrate")
-        elif button == 10:                  # R-stick click - toggle rotation
+        elif button == 3:                   # Y - toggle on-device rotation
             self.rotated = not self.rotated
             command_queue.append("rotated on" if self.rotated else "rotated off")
             print(f"\n[cmd] rotated {'on' if self.rotated else 'off'}")
+        elif button == 10:                  # R-stick click - reset all plots
+            reset_view()
         elif button == 8:                   # Back/View - quit
             request_quit()
 
@@ -953,10 +926,9 @@ controls_overlay = QtWidgets.QLabel(surface_view)
 controls_overlay.setText(
     "L-Stick: left motor   R-Stick: right motor\n"
     "LB / RB: power - / +\n"
-    "A: record (HDF5+video)   B: material marker\n"
-    "X: reset plots\n"
-    "L-click: calibrate   R-click: toggle rotation\n"
-    "Back/View: quit"
+    "A: CSV write   B: material marker\n"
+    "X: calibrate   Y: toggle rotation\n"
+    "R-click: reset plots   Back/View: quit"
 )
 controls_overlay.setStyleSheet(
     "color: rgba(200, 200, 200, 150); font-size: 14px; background: transparent;"
@@ -1389,7 +1361,10 @@ def place_material_marker():
         return
     label = pg.TextItem(f"Material\n {len(material_marker_items) + 1}",
                         anchor=(0.5, 0.5), color=(255, 255, 255), fill=(0, 0, 0, 0))
-    label.setPos(state.sensor1[-1], state.sensor2[-1])
+    # Carry both placements so update() can match the phase (Rp) or time x-axis.
+    label.pos_rp = (state.sensor1[-1], state.sensor2[-1])
+    label.pos_time = (state.timestamps[-1], state.sensor2[-1])
+    label.setPos(*label.pos_rp)
     plot_xy.addItem(label)
     material_marker_items.append(label)
     print(f"\nAdded label at ({state.sensor1[-1]:.2f}, {state.sensor2[-1]:.2f})")
@@ -1503,40 +1478,6 @@ def update_raw_readout(rp, l, flags, crack_size):
     )
 
 
-# --- TEMP perf instrumentation (remove once the bottleneck is found) ---------
-# Accumulates wall-clock time per labelled section and prints avg/max every 2 s.
-# Tells us whether the cost is serial I/O to the bridge (ser_write/ser_drain),
-# the joystick read, or the rendering (redraw) -- without guessing.
-_PERF = {}
-_perf_last_report = [time.monotonic()]
-
-
-def _perf_add(name, dt):
-    s = _PERF.setdefault(name, [0.0, 0, 0.0])
-    s[0] += dt
-    s[1] += 1
-    if dt > s[2]:
-        s[2] = dt
-    now = time.monotonic()
-    if now - _perf_last_report[0] >= 2.0:
-        parts = []
-        for k in sorted(_PERF):
-            tot, cnt, mx = _PERF[k]
-            if cnt:
-                parts.append(f"{k}: avg={tot / cnt * 1e3:.2f}ms max={mx * 1e3:.2f}ms n={cnt}")
-            _PERF[k] = [0.0, 0, 0.0]
-        print("[perf] " + " | ".join(parts))
-        _perf_last_report[0] = now
-
-
-def _timed(name, fn, *args):
-    t0 = time.perf_counter()
-    try:
-        return fn(*args)
-    finally:
-        _perf_add(name, time.perf_counter() - t0)
-
-
 def control_tick():
     """Push the latest motor command and drain all streamed telemetry.
 
@@ -1554,7 +1495,7 @@ def control_tick():
     left = right = 0
     if joystick is not None:
         try:
-            left, right = _timed("joystick", joystick.update)
+            left, right = joystick.update()
             joystick.process_buttons()      # run queued button binds on this thread
         except Exception as exc:
             print(f"\nJoystick read failed: {exc}")
@@ -1571,13 +1512,13 @@ def control_tick():
 
     # Motor command, fire-and-forget (left inverted to match wiring). No reply.
     try:
-        _timed("ser_write", link.comm.send_motor_command, left * -1, right)
+        link.comm.send_motor_command(left * -1, right)
     except serial.SerialException:
         link.disconnect("device lost")
         return
 
     # Drain every telemetry frame streamed since the last tick (non-blocking).
-    packets = _timed("ser_drain", link.comm.drain_packets)
+    packets = link.comm.drain_packets()
 
     # Show any Platform CLI replies that arrived (status/help/OK/ERR...).
     for line in link.comm.drain_responses():
@@ -1627,7 +1568,10 @@ def process_packet(packet):
     if crack_detected and not state.last_crack_flag:
         state.register_crack(t_sec, crack_size)
         marker = pg.TextItem("x", anchor=(0.5, 0.5), color=(255, 0, 0))
-        marker.setPos(rp, l)
+        # Carry both placements so update() can match the phase (Rp) or time x-axis.
+        marker.pos_rp = (rp, l)
+        marker.pos_time = (t_sec, l)
+        marker.setPos(*marker.pos_rp)
         plot_xy.addItem(marker)
         crack_marker_items.append(marker)
         print(f"\n>>> CRACK detected: size~{crack_size:.1f} thou")
@@ -1735,6 +1679,13 @@ def update():
     set_right_x_mode(state.right_x_mode)
 
     right_uses_time_x = (state.right_x_mode == "TIME") or state.right_plot_auto_time_fallback
+
+    # The phase-plot overlays (crack X's + material labels) carry both an (Rp, L)
+    # and a (time, L) position. Place them to match whichever x the plot is
+    # showing so they stay meaningful in both the phase and L-vs-time views.
+    for _marker in crack_marker_items + material_marker_items:
+        _marker.setPos(*(_marker.pos_time if right_uses_time_x else _marker.pos_rp))
+
     if right_uses_time_x:
         crack_plot.setXLink(plot_xy)
     else:
@@ -1764,11 +1715,11 @@ def update():
 # both on the GUI thread, so the redraw is kept cheap to avoid starving control.
 control_timer = QtCore.QTimer()
 control_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-control_timer.timeout.connect(lambda: _timed("control_total", control_tick))  # TEMP perf
+control_timer.timeout.connect(control_tick)
 control_timer.start(int(LOOP_INTERVAL * 1000))      # ~100 Hz
 
 redraw_timer = QtCore.QTimer()
-redraw_timer.timeout.connect(lambda: _timed("redraw_total", update))          # TEMP perf
+redraw_timer.timeout.connect(update)
 redraw_timer.start(50)                               # ~20 fps
 
 
@@ -1803,7 +1754,7 @@ def main():
     print("Connect the bridge link (lower-right), then drive / configure:")
     print("  Left Stick: left motor      Right Stick: right motor")
     print("  LB/RB: power -/+            A: toggle CSV write      B: material marker")
-    print("  X / Space: reset plots      L-click: calibrate       R-click: toggle rotation")
+    print("  X: calibrate   Y: toggle rotation   R-click: reset plots   Space: reset")
     print("  Back/View: quit             P: pause   F: CSV write   1/2/3: 3D views")
     print("  Click the phase-plot x-axis to toggle R_p <-> Time; crack-plot y-axis for size <-> mag")
     print("=" * 64)

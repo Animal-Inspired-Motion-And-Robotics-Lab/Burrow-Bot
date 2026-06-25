@@ -56,7 +56,7 @@ pyqtgraph). Experiment data records to CSV via the GUI's "Write to File" toggle
 ## Telemetry packet (Platform → PC, little-endian, 27 bytes)
 
 Defined in `src/platform/main.cpp` (`sendLDCResponse`) and parsed in the Python
-app (`SerialComm.read_ldc_packet`, `RESP_LEN = 27`). Keep the two in sync.
+app (`SerialComm.drain_packets` / `_consume_frames`, `RESP_LEN = 27`). Keep in sync.
 
 | Offset | Type   | Field        | Notes                                        |
 |--------|--------|--------------|----------------------------------------------|
@@ -64,9 +64,9 @@ app (`SerialComm.read_ldc_packet`, `RESP_LEN = 27`). Keep the two in sync.
 | 1..8   | u64    | timestamp    | `micros()`                                   |
 | 9..10  | i16    | motor L PWM  |                                              |
 | 11..12 | i16    | motor R PWM  |                                              |
-| 13..16 | f32    | Rp (ohms)    | raw, pre-rotation                            |
-| 17..20 | f32    | L (uH)       | raw, pre-rotation                            |
-| 21     | u8     | flags        | bit0 = crack detected, bit1 = calibrated     |
+| 13..16 | f32    | Rp (ohms)    | raw; rotated into the calibrated frame if bit1 |
+| 17..20 | f32    | L (uH)       | raw; rotated into the calibrated frame if bit1 |
+| 21     | u8     | flags        | bit0 = crack detected, bit1 = rotated/calibrated |
 | 22..25 | f32    | crack_size   | thou (fit peak height × length scale)        |
 | 26     | u8     | END 0x55     |                                              |
 

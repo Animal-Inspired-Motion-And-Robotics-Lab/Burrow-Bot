@@ -88,8 +88,8 @@ int16_t currentRightPWM = 0;
 //   [1..8]   uint64  timestamp (micros)
 //   [9..10]  int16   motor L PWM
 //   [11..12] int16   motor R PWM
-//   [13..16] float   Rp (ohms)         raw, pre-rotation (PC keeps plotting this)
-//   [17..20] float   L  (uH)           raw, pre-rotation
+//   [13..16] float   Rp (ohms)         raw, or rotated into the calibrated frame
+//   [17..20] float   L  (uH)           when `rotated` is on (flags bit1)
 //   [21]     uint8   flags  bit0=crack detected, bit1=rotated/calibrated
 //   [22..25] float   crack_size (thou) fit peak height * length-estimate scale
 //   [26]     0x55  END
@@ -283,8 +283,19 @@ void sendLDCResponse(const ldc1101_measurement_t& m, bool crackDetected,
   int16_t motors[2] = {currentLeftPWM, currentRightPWM};
   memcpy(p + 9, motors, 4);
 
+  // Raw (Rp, L) by default; when rotation is on, send the sample rotated into
+  // the calibrated frame (translate to center, rotate by the calibrated angle,
+  // translate back) so the PC sees the flattened cloud. Off -> unchanged raw.
   float rp = m.Rp_ohms;
   float l = m.L_uH;
+  if (state.rotated) {
+    float centerRp, centerL;
+    getRotationCenter(&centerRp, &centerL);
+    float rotRp, rotL;
+    rotateSample(rp - centerRp, l - centerL, getRotationAngle(), rotRp, rotL);
+    rp = rotRp + centerRp;
+    l = rotL + centerL;
+  }
   memcpy(p + 13, &rp, 4);
   memcpy(p + 17, &l, 4);
 
