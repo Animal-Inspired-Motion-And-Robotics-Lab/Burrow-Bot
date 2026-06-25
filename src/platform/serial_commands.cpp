@@ -24,6 +24,7 @@
 
 #include "LED.h"
 #include "calibration.h"
+#include "cmd_reply.h"
 #include "crack_detection.h"
 #include "measurement_arrays.h"
 #include "memory.h"
@@ -76,89 +77,89 @@ void configureSensor() {
 // Each `<name>` command shown here corresponds 1:1 to a `<name>=...` token
 // printed by `status`.
 void printHelp() {
-  Serial.println("commands:");
-  Serial.println("  help                       // show this list");
-  Serial.println("  status                     // print all current values");
+  Reply.println("commands:");
+  Reply.println("  help                       // show this list");
+  Reply.println("  status                     // print all current values");
 
   // Sensor parameters.
-  Serial.println("  l_h [uH]                   // sensor inductance");
-  Serial.println("  c_f [pF]                   // sensor capacitance");
-  Serial.println("  q [ratio]                  // sensor quality factor");
+  Reply.println("  l_h [uH]                   // sensor inductance");
+  Reply.println("  c_f [pF]                   // sensor capacitance");
+  Reply.println("  q [ratio]                  // sensor quality factor");
 
   // Reading mode.
-  Serial.println("  mode lrp|lhr               // measurement mode");
-  Serial.println("  speed accuracy|balanced1|balanced2|fast");
-  Serial.println("  stream on|off              // streaming output on/off");
-  Serial.println("  delay <ms>                 // sample period");
+  Reply.println("  mode lrp|lhr               // measurement mode");
+  Reply.println("  speed accuracy|balanced1|balanced2|fast");
+  Reply.println("  stream on|off              // streaming output on/off");
+  Reply.println("  delay <ms>                 // sample period");
 
   // Signal processing / calibration.
-  Serial.println("  smoothing <n>              // moving-average window");
-  Serial.println("  rotated on|off             // apply calibrated rotation");
-  Serial.println("  angle [radians]            // get/set rotation angle");
-  Serial.println("  calibrate [samples]        // run PCA calibration on recent samples");
-  Serial.println("  baseline [samples]         // re-anchor rotation center to recent flat signal");
+  Reply.println("  smoothing <n>              // moving-average window");
+  Reply.println("  rotated on|off             // apply calibrated rotation");
+  Reply.println("  angle [radians]            // get/set rotation angle");
+  Reply.println("  calibrate [samples]        // run PCA calibration on recent samples");
+  Reply.println("  baseline [samples]         // re-anchor rotation center to recent flat signal");
 
   // Crack detection tuning.
-  Serial.println("  crack_window [n]           // parabola fit window samples");
-  Serial.println("  crack_threshold [val]      // min parabola peak above baseline");
-  Serial.println("  crack_r2 [0..1]            // min parabola R^2 fit");
-  Serial.println("  crack_deviation [rad]      // max angular tilt of (t,Rp,L) curve off the t-L plane, 0..pi/2");
-  Serial.println("  crack_scale [scale]        // peak->length scale factor");
-  Serial.println("  crack_output on|off        // emit per-crack >mag >crack_x >crack_size >width");
-  Serial.println("  crack_debug on|off         // print crack detector debug state");
+  Reply.println("  crack_window [n]           // parabola fit window samples");
+  Reply.println("  crack_threshold [val]      // min parabola peak above baseline");
+  Reply.println("  crack_r2 [0..1]            // min parabola R^2 fit");
+  Reply.println("  crack_deviation [rad]      // max angular tilt of (t,Rp,L) curve off the t-L plane, 0..pi/2");
+  Reply.println("  crack_scale [scale]        // peak->length scale factor");
+  Reply.println("  crack_output on|off        // emit per-crack >mag >crack_x >crack_size >width");
+  Reply.println("  crack_debug on|off         // print crack detector debug state");
 
   // Persistent per-material profiles (saved to NVS flash).
-  Serial.println("  save <material>            // store all settings under a name");
-  Serial.println("  retrieve <material>        // load settings saved under a name");
-  Serial.println("  materials                  // list saved materials + their rotation angle");
-  Serial.println("  get_material               // name the saved material whose angle is closest to the current calibration");
-  Serial.println("  forget <material>          // delete a saved material");
+  Reply.println("  save <material>            // store all settings under a name");
+  Reply.println("  retrieve <material>        // load settings saved under a name");
+  Reply.println("  materials                  // list saved materials + their rotation angle");
+  Reply.println("  get_material               // name the saved material whose angle is closest to the current calibration");
+  Reply.println("  forget <material>          // delete a saved material");
 }
 
 void printStatus() {
   // Sensor parameters. Print in the same units the commands accept.
-  Serial.print("l_h=");
-  Serial.print(gConfig.sensor_l_h / kMicroToBase, 6);
-  Serial.print(" c_f=");
-  Serial.print(gConfig.sensor_c_f / kPicoToBase, 6);
-  Serial.print(" q=");
-  Serial.println(gConfig.sensor_q, 6);
+  Reply.print("l_h=");
+  Reply.print(gConfig.sensor_l_h / kMicroToBase, 6);
+  Reply.print(" c_f=");
+  Reply.print(gConfig.sensor_c_f / kPicoToBase, 6);
+  Reply.print(" q=");
+  Reply.println(gConfig.sensor_q, 6);
 
   // Reading mode.
-  Serial.print("mode=");
-  Serial.print(modeToString(gState.mode));
-  Serial.print(" speed=");
-  Serial.print(speedToString(gState.speed_mode));
-  Serial.print(" stream=");
-  Serial.print(gState.streaming_enabled ? "on" : "off");
-  Serial.print(" delay=");
-  Serial.println((unsigned long)gState.reading_delay_ms);
+  Reply.print("mode=");
+  Reply.print(modeToString(gState.mode));
+  Reply.print(" speed=");
+  Reply.print(speedToString(gState.speed_mode));
+  Reply.print(" stream=");
+  Reply.print(gState.streaming_enabled ? "on" : "off");
+  Reply.print(" delay=");
+  Reply.println((unsigned long)gState.reading_delay_ms);
 
   // Signal processing.
-  Serial.print("smoothing=");
-  Serial.print((unsigned int)getFilterWindow());
-  Serial.print(" rotated=");
-  Serial.print(gState.rotated ? "on" : "off");
-  Serial.print(" angle=");
-  Serial.println(getRotationAngle(), 6);
+  Reply.print("smoothing=");
+  Reply.print((unsigned int)getFilterWindow());
+  Reply.print(" rotated=");
+  Reply.print(gState.rotated ? "on" : "off");
+  Reply.print(" angle=");
+  Reply.println(getRotationAngle(), 6);
 
   // Crack detection.
-  Serial.print("crack_window=");
-  Serial.print((unsigned int)crackDetectionGetWindowSamples());
-  Serial.print(" crack_threshold=");
-  Serial.print(crackDetectionGetThreshold(), 6);
-  Serial.print(" crack_r2=");
-  Serial.println(crackDetectionGetMinParabolaR2(), 6);
+  Reply.print("crack_window=");
+  Reply.print((unsigned int)crackDetectionGetWindowSamples());
+  Reply.print(" crack_threshold=");
+  Reply.print(crackDetectionGetThreshold(), 6);
+  Reply.print(" crack_r2=");
+  Reply.println(crackDetectionGetMinParabolaR2(), 6);
 
-  Serial.print("crack_deviation=");
-  Serial.print(crackDetectionGetMaxDeviationRad(), 6);
-  Serial.print(" crack_scale=");
-  Serial.println(crackDetectionGetLengthEstimateScale(), 6);
+  Reply.print("crack_deviation=");
+  Reply.print(crackDetectionGetMaxDeviationRad(), 6);
+  Reply.print(" crack_scale=");
+  Reply.println(crackDetectionGetLengthEstimateScale(), 6);
 
-  Serial.print("crack_output=");
-  Serial.print(gState.crack_output ? "on" : "off");
-  Serial.print(" crack_debug=");
-  Serial.println(gState.crack_debug_output ? "on" : "off");
+  Reply.print("crack_output=");
+  Reply.print(gState.crack_output ? "on" : "off");
+  Reply.print(" crack_debug=");
+  Reply.println(gState.crack_debug_output ? "on" : "off");
 }
 
 // Dispatch one user-typed line. Format: <command> [arg ...]. Whitespace-only
@@ -194,20 +195,20 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed <= 0.0f) {
-        Serial.println("ERR l_h must be > 0 (uH)");
+        Reply.println("ERR l_h must be > 0 (uH)");
         return;
       }
       char* extra = strtok(nullptr, " \t");
       if (extra != nullptr) {
-        Serial.println("ERR usage: l_h [uH]");
+        Reply.println("ERR usage: l_h [uH]");
         return;
       }
       gConfig.sensor_l_h = parsed * kMicroToBase;
       configureSensor();
     }
 
-    Serial.print("l_h=");
-    Serial.println(gConfig.sensor_l_h / kMicroToBase, 6);
+    Reply.print("l_h=");
+    Reply.println(gConfig.sensor_l_h / kMicroToBase, 6);
     return;
   }
 
@@ -217,20 +218,20 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed <= 0.0f) {
-        Serial.println("ERR c_f must be > 0 (pF)");
+        Reply.println("ERR c_f must be > 0 (pF)");
         return;
       }
       char* extra = strtok(nullptr, " \t");
       if (extra != nullptr) {
-        Serial.println("ERR usage: c_f [pF]");
+        Reply.println("ERR usage: c_f [pF]");
         return;
       }
       gConfig.sensor_c_f = parsed * kPicoToBase;
       configureSensor();
     }
 
-    Serial.print("c_f=");
-    Serial.println(gConfig.sensor_c_f / kPicoToBase, 6);
+    Reply.print("c_f=");
+    Reply.println(gConfig.sensor_c_f / kPicoToBase, 6);
     return;
   }
 
@@ -240,20 +241,20 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed <= 0.0f) {
-        Serial.println("ERR q must be > 0");
+        Reply.println("ERR q must be > 0");
         return;
       }
       char* extra = strtok(nullptr, " \t");
       if (extra != nullptr) {
-        Serial.println("ERR usage: q [value]");
+        Reply.println("ERR usage: q [value]");
         return;
       }
       gConfig.sensor_q = parsed;
       configureSensor();
     }
 
-    Serial.print("q=");
-    Serial.println(gConfig.sensor_q, 6);
+    Reply.print("q=");
+    Reply.println(gConfig.sensor_q, 6);
     return;
   }
 
@@ -268,19 +269,19 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0') {
-        Serial.println("ERR usage: angle [radians]");
+        Reply.println("ERR usage: angle [radians]");
         return;
       }
       char* extra = strtok(nullptr, " \t");
       if (extra != nullptr) {
-        Serial.println("ERR usage: angle [radians]");
+        Reply.println("ERR usage: angle [radians]");
         return;
       }
       setRotationAngle(parsed);
     }
 
-    Serial.print("angle=");
-    Serial.println(getRotationAngle(), 6);
+    Reply.print("angle=");
+    Reply.println(getRotationAngle(), 6);
     return;
   }
 
@@ -290,59 +291,59 @@ void processCommand(char* line) {
   if (strcmp(token, "stream") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: stream on|off");
+      Reply.println("ERR usage: stream on|off");
       return;
     }
     if (strcmp(value, "on") == 0) {
       gState.streaming_enabled = true;
-      Serial.println("OK stream on");
+      Reply.println("OK stream on");
       return;
     }
     if (strcmp(value, "off") == 0) {
       gState.streaming_enabled = false;
-      Serial.println("OK stream off");
+      Reply.println("OK stream off");
       return;
     }
-    Serial.println("ERR usage: stream on|off");
+    Reply.println("ERR usage: stream on|off");
     return;
   }
 
   if (strcmp(token, "delay") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: delay <ms>");
+      Reply.println("ERR usage: delay <ms>");
       return;
     }
 
     long parsed = strtol(value, nullptr, 10);
     if (parsed <= 0 || parsed > kMaxReadingDelayMs) {
-      Serial.print("ERR delay must be 1..");
-      Serial.println(kMaxReadingDelayMs);
+      Reply.print("ERR delay must be 1..");
+      Reply.println(kMaxReadingDelayMs);
       return;
     }
 
     gState.reading_delay_ms = (uint32_t)parsed;
-    Serial.print("OK delay ");
-    Serial.println((unsigned long)gState.reading_delay_ms);
+    Reply.print("OK delay ");
+    Reply.println((unsigned long)gState.reading_delay_ms);
     return;
   }
 
   if (strcmp(token, "smoothing") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: smoothing <n>");
+      Reply.println("ERR usage: smoothing <n>");
       return;
     }
 
     long parsed = strtol(value, nullptr, 10);
     if (parsed <= 0) {
-      Serial.println("ERR smoothing must be >= 1");
+      Reply.println("ERR smoothing must be >= 1");
       return;
     }
 
     setFilterWindow((size_t)parsed);
-    Serial.print("OK smoothing ");
-    Serial.println((unsigned int)getFilterWindow());
+    Reply.print("OK smoothing ");
+    Reply.println((unsigned int)getFilterWindow());
     return;
   }
 
@@ -355,14 +356,14 @@ void processCommand(char* line) {
     if (value != nullptr) {
       long parsed = strtol(value, nullptr, 10);
       if (parsed <= 0) {
-        Serial.println("ERR crack_window must be >= 1");
+        Reply.println("ERR crack_window must be >= 1");
         return;
       }
       crackDetectionSetWindowSamples((size_t)parsed);
     }
 
-    Serial.print("crack_window=");
-    Serial.println((unsigned int)crackDetectionGetWindowSamples());
+    Reply.print("crack_window=");
+    Reply.println((unsigned int)crackDetectionGetWindowSamples());
     return;
   }
 
@@ -372,14 +373,14 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed < 0.0f) {
-        Serial.println("ERR crack_threshold must be >= 0");
+        Reply.println("ERR crack_threshold must be >= 0");
         return;
       }
       crackDetectionSetThreshold(parsed);
     }
 
-    Serial.print("crack_threshold=");
-    Serial.println(crackDetectionGetThreshold(), 6);
+    Reply.print("crack_threshold=");
+    Reply.println(crackDetectionGetThreshold(), 6);
     return;
   }
 
@@ -389,14 +390,14 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed < 0.0f || parsed > 1.0f) {
-        Serial.println("ERR crack_r2 must be 0..1");
+        Reply.println("ERR crack_r2 must be 0..1");
         return;
       }
       crackDetectionSetMinParabolaR2(parsed);
     }
 
-    Serial.print("crack_r2=");
-    Serial.println(crackDetectionGetMinParabolaR2(), 6);
+    Reply.print("crack_r2=");
+    Reply.println(crackDetectionGetMinParabolaR2(), 6);
     return;
   }
 
@@ -406,19 +407,19 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed < 0.0f) {
-        Serial.println("ERR crack_deviation must be 0..pi/2 (rad)");
+        Reply.println("ERR crack_deviation must be 0..pi/2 (rad)");
         return;
       }
       char* extra = strtok(nullptr, " \t");
       if (extra != nullptr) {
-        Serial.println("ERR usage: crack_deviation [angle_rad]");
+        Reply.println("ERR usage: crack_deviation [angle_rad]");
         return;
       }
       crackDetectionSetMaxDeviationRad(parsed);
     }
 
-    Serial.print("crack_deviation=");
-    Serial.println(crackDetectionGetMaxDeviationRad(), 6);
+    Reply.print("crack_deviation=");
+    Reply.println(crackDetectionGetMaxDeviationRad(), 6);
     return;
   }
 
@@ -428,54 +429,54 @@ void processCommand(char* line) {
       char* end = nullptr;
       float parsed = strtof(value, &end);
       if (end == value || *end != '\0' || parsed < 0.0f) {
-        Serial.println("ERR crack_scale must be >= 0");
+        Reply.println("ERR crack_scale must be >= 0");
         return;
       }
       crackDetectionSetLengthEstimateScale(parsed);
     }
 
-    Serial.print("crack_scale=");
-    Serial.println(crackDetectionGetLengthEstimateScale(), 6);
+    Reply.print("crack_scale=");
+    Reply.println(crackDetectionGetLengthEstimateScale(), 6);
     return;
   }
 
   if (strcmp(token, "crack_debug") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: crack_debug on|off");
+      Reply.println("ERR usage: crack_debug on|off");
       return;
     }
     if (strcmp(value, "on") == 0) {
       gState.crack_debug_output = true;
-      Serial.println("OK crack_debug on");
+      Reply.println("OK crack_debug on");
       return;
     }
     if (strcmp(value, "off") == 0) {
       gState.crack_debug_output = false;
-      Serial.println("OK crack_debug off");
+      Reply.println("OK crack_debug off");
       return;
     }
-    Serial.println("ERR usage: crack_debug on|off");
+    Reply.println("ERR usage: crack_debug on|off");
     return;
   }
 
   if (strcmp(token, "crack_output") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: crack_output on|off");
+      Reply.println("ERR usage: crack_output on|off");
       return;
     }
     if (strcmp(value, "on") == 0) {
       gState.crack_output = true;
-      Serial.println("OK crack_output on");
+      Reply.println("OK crack_output on");
       return;
     }
     if (strcmp(value, "off") == 0) {
       gState.crack_output = false;
-      Serial.println("OK crack_output off");
+      Reply.println("OK crack_output off");
       return;
     }
-    Serial.println("ERR usage: crack_output on|off");
+    Reply.println("ERR usage: crack_output on|off");
     return;
   }
 
@@ -486,7 +487,7 @@ void processCommand(char* line) {
   if (strcmp(token, "mode") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: mode lrp|lhr");
+      Reply.println("ERR usage: mode lrp|lhr");
       return;
     }
 
@@ -496,21 +497,21 @@ void processCommand(char* line) {
     } else if (strcmp(value, "lhr") == 0) {
       newMode = LDC1101_MODE_LHR;
     } else {
-      Serial.println("ERR usage: mode lrp|lhr");
+      Reply.println("ERR usage: mode lrp|lhr");
       return;
     }
 
     gState.mode = newMode;
     configureSensor();
-    Serial.print("OK mode ");
-    Serial.println(modeToString(gState.mode));
+    Reply.print("OK mode ");
+    Reply.println(modeToString(gState.mode));
     return;
   }
 
   if (strcmp(token, "speed") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: speed accuracy|balanced1|balanced2|fast");
+      Reply.println("ERR usage: speed accuracy|balanced1|balanced2|fast");
       return;
     }
 
@@ -524,14 +525,14 @@ void processCommand(char* line) {
     } else if (strcmp(value, "fast") == 0) {
       newSpeed = LDC_SPEED_FAST;
     } else {
-      Serial.println("ERR usage: speed accuracy|balanced1|balanced2|fast");
+      Reply.println("ERR usage: speed accuracy|balanced1|balanced2|fast");
       return;
     }
 
     gState.speed_mode = newSpeed;
     configureSensor();
-    Serial.print("OK speed ");
-    Serial.println(speedToString(gState.speed_mode));
+    Reply.print("OK speed ");
+    Reply.println(speedToString(gState.speed_mode));
     return;
   }
 
@@ -545,15 +546,15 @@ void processCommand(char* line) {
     if (value != nullptr) {
       long parsed = strtol(value, nullptr, 10);
       if (parsed <= 0 || parsed > kMaxCalibrationSamples) {
-        Serial.print("ERR calibrate samples must be 1..");
-        Serial.println(kMaxCalibrationSamples);
+        Reply.print("ERR calibrate samples must be 1..");
+        Reply.println(kMaxCalibrationSamples);
         return;
       }
       sampleCount = (size_t)parsed;
     }
     ledFlash(10, 30);
-    Serial.print("calibrate start samples=");
-    Serial.println((unsigned int)sampleCount);
+    Reply.print("calibrate start samples=");
+    Reply.println((unsigned int)sampleCount);
     calibration_result_t result = calibrationRun(gConfig.sensor_c_f, sampleCount);
     calibrationPrintResult(&result);
     return;
@@ -571,15 +572,15 @@ void processCommand(char* line) {
     if (value != nullptr) {
       long parsed = strtol(value, nullptr, 10);
       if (parsed <= 0 || parsed > kMaxCalibrationSamples) {
-        Serial.print("ERR baseline samples must be 1..");
-        Serial.println(kMaxCalibrationSamples);
+        Reply.print("ERR baseline samples must be 1..");
+        Reply.println(kMaxCalibrationSamples);
         return;
       }
       sampleCount = (size_t)parsed;
     }
     ledFlash(10, 30);
-    Serial.print("baseline start samples=");
-    Serial.println((unsigned int)sampleCount);
+    Reply.print("baseline start samples=");
+    Reply.println((unsigned int)sampleCount);
     baseline_result_t result = baselineRun(sampleCount);
     baselinePrintResult(&result);
     return;
@@ -592,22 +593,22 @@ void processCommand(char* line) {
       strcmp(token, "rotation") == 0) {
     char* value = strtok(nullptr, " \t");
     if (value == nullptr) {
-      Serial.println("ERR usage: rotated on|off");
+      Reply.println("ERR usage: rotated on|off");
       return;
     }
     if (strcmp(value, "on") == 0) {
       gState.rotated = true;
       setRotationEnabled(true);
-      Serial.println("OK rotated on");
+      Reply.println("OK rotated on");
       return;
     }
     if (strcmp(value, "off") == 0) {
       gState.rotated = false;
       setRotationEnabled(false);
-      Serial.println("OK rotated off");
+      Reply.println("OK rotated off");
       return;
     }
-    Serial.println("ERR usage: rotated on|off");
+    Reply.println("ERR usage: rotated on|off");
     return;
   }
 
@@ -621,14 +622,14 @@ void processCommand(char* line) {
   if (strcmp(token, "save") == 0) {
     char* name = strtok(nullptr, " \t");
     if (name == nullptr || strtok(nullptr, " \t") != nullptr) {
-      Serial.println("ERR usage: save <material>");
+      Reply.println("ERR usage: save <material>");
       return;
     }
     if (memorySaveMaterial(name, &gConfig, &gState)) {
-      Serial.print("OK saved ");
-      Serial.println(name);
+      Reply.print("OK saved ");
+      Reply.println(name);
     } else {
-      Serial.println("ERR save failed (bad name or storage error)");
+      Reply.println("ERR save failed (bad name or storage error)");
     }
     return;
   }
@@ -636,26 +637,26 @@ void processCommand(char* line) {
   if (strcmp(token, "retrieve") == 0 || strcmp(token, "load") == 0) {
     char* name = strtok(nullptr, " \t");
     if (name == nullptr || strtok(nullptr, " \t") != nullptr) {
-      Serial.println("ERR usage: retrieve <material>");
+      Reply.println("ERR usage: retrieve <material>");
       return;
     }
     if (memoryRetrieveMaterial(name, &gConfig, &gState)) {
       // Restored sensor/mode/speed need to reach the chip; rotation and crack
       // settings were already applied inside memoryRetrieveMaterial().
       configureSensor();
-      Serial.print("OK retrieved ");
-      Serial.println(name);
+      Reply.print("OK retrieved ");
+      Reply.println(name);
       printStatus();
     } else {
-      Serial.print("ERR no saved material: ");
-      Serial.println(name);
+      Reply.print("ERR no saved material: ");
+      Reply.println(name);
     }
     return;
   }
 
   if (strcmp(token, "materials") == 0) {
     if (strtok(nullptr, " \t") != nullptr) {
-      Serial.println("ERR usage: materials");
+      Reply.println("ERR usage: materials");
       return;
     }
     memoryListMaterials();
@@ -668,7 +669,7 @@ void processCommand(char* line) {
   // `materials` (the list command). Report-only; doesn't load.
   if (strcmp(token, "get_material") == 0) {
     if (strtok(nullptr, " \t") != nullptr) {
-      Serial.println("ERR usage: get_material");
+      Reply.println("ERR usage: get_material");
       return;
     }
     memoryMatchByAngle(getRotationAngle());
@@ -678,21 +679,21 @@ void processCommand(char* line) {
   if (strcmp(token, "forget") == 0) {
     char* name = strtok(nullptr, " \t");
     if (name == nullptr || strtok(nullptr, " \t") != nullptr) {
-      Serial.println("ERR usage: forget <material>");
+      Reply.println("ERR usage: forget <material>");
       return;
     }
     if (memoryForgetMaterial(name)) {
-      Serial.print("OK forgot ");
-      Serial.println(name);
+      Reply.print("OK forgot ");
+      Reply.println(name);
     } else {
-      Serial.print("ERR no saved material: ");
-      Serial.println(name);
+      Reply.print("ERR no saved material: ");
+      Reply.println(name);
     }
     return;
   }
 
-  Serial.print("ERR unknown command: ");
-  Serial.println(token);
+  Reply.print("ERR unknown command: ");
+  Reply.println(token);
 }
 
 }  // namespace
@@ -757,7 +758,10 @@ void serialCommandsProcessLine(const char* line) {
   char buf[kCommandBufferLen];
   strncpy(buf, line, kCommandBufferLen - 1);
   buf[kCommandBufferLen - 1] = '\0';
+  // Frame this command's output back over Serial1 so the PC app can show it.
+  Reply.beginBridgeCapture();
   processCommand(buf);
+  Reply.endBridgeCapture();
 }
 
 // Snapshots of the live state for main.cpp. Returned by value (small structs)

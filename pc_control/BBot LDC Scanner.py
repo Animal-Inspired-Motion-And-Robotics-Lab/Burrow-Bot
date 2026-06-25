@@ -8,7 +8,7 @@
 #                                   joystick -> motor commands, binary telemetry
 #                                   read-back, HDF5 + camera recording)
 #
-# Unlike the ECLAIR scanner, the burrow-bot is NOT a passive stream: the antenna
+# Unlike the ECLAIR scanner, the burrow-bot is NOT a passive stream: the Platform
 # only answers when polled. So this app owns the 100 Hz request/response loop --
 # every tick it sends a motor command (the joystick's, or 0/0 when idle), then
 # reads exactly one 27-byte telemetry packet back over the bridge. Those samples
@@ -17,16 +17,16 @@
 # Layout (mirrors LDC SCANNER V5):
 #   upper-left   3D R_p / L / time surface
 #   upper-right  phase-space (R_p vs L)  <->  time trace  (click the x-axis)
-#   lower-left   live readout + antenna CLI console + CSV write controls
+#   lower-left   live readout + Platform CLI console + CSV write controls
 #   lower-right  crack-detection plot + serial-link connection controls
 #
 # Two serial channels, exactly as the firmware expects (see CLAUDE.md):
 #   * binary motor/telemetry frames travel over the one bridge link this app
 #     opens (PC <-USB-> bridge ESP32 <-UART-> platform ESP32);
-#   * antenna CLI commands are wrapped as [0xAB][len][ascii][0x55] frames and
-#     sent over that SAME link -- they are fire-and-forget (the antenna prints
-#     replies only on its own USB-CDC port, not back through the bridge), so the
-#     console echoes what it sent rather than waiting for text.
+#   * Platform CLI commands are wrapped as [0xAB][len][ascii][0x55] frames and
+#     sent over that SAME link; the Platform frames each reply line back as
+#     [0xAC][len][ascii][0x55], which this app demuxes from the telemetry stream
+#     and shows in the console (a tick or two later -- not synchronous).
 #
 # Sections, top to bottom:
 #   1. Configuration        2. Pure helpers (parsing-free: geometry only)
@@ -95,6 +95,7 @@ TELEMETRY_TIMEOUT_MS = int(LOOP_INTERVAL * 1000 * 0.8)
 # --- Packet framing (firmware src/platform/main.cpp) -----------------------
 PKT_START = 0xAA                    # motor command frame + telemetry frame
 CMD_START = 0xAB                    # ASCII CLI frame: [0xAB][len][ascii][0x55]
+REPLY_START = 0xAC                  # Platform CLI reply frame: [0xAC][len][ascii][0x55]
 PKT_END = 0x55
 # Telemetry: [START][ts u64][motorL i16][motorR i16][Rp f][L f][flags][crack_size f][END]
 RESP_LEN = 27
@@ -142,7 +143,7 @@ def scale_line_width(base_width, percent):
 def has_usable_rp(rp_vals, eps=RP_ZERO_EPSILON):
     """True when recent R_p values vary by more than ``eps`` (i.e. not flat).
 
-    When the antenna is in RP+L mode but R_p is unused/flat, the phase-space
+    When the Platform is in RP+L mode but R_p is unused/flat, the phase-space
     plot would collapse to a vertical line; the redraw uses this to fall back to
     a time trace so live L motion is still visible.
     """
@@ -296,7 +297,7 @@ class CsvLogger:
 # ---------------------------------------------------------------------------
 
 class SerialComm:
-    """The binary motor/telemetry link to the antenna via the bridge ESP32.
+    """The binary motor/telemetry link to the Platform via the bridge ESP32.
 
     Ported from the BBot control code. Owns one pyserial port and the
     request/response framing: motor commands out, 27-byte telemetry frames back,
@@ -308,7 +309,8 @@ class SerialComm:
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
         self.read_buffer = b""
-        time.sleep(1)                       # let the bridge/antenna settle
+        self.responses = []                 # decoded Platform CLI reply lines, drained by the UI
+        time.sleep(1)                       # let the bridge/Platform settle
         print(f"Serial connected at {baudrate} baud")
 
     def send_motor_command(self, left, right):
@@ -325,7 +327,7 @@ class SerialComm:
     def send_command(self, text):
         """Send an ASCII CLI command frame: [0xAB][len][ascii][0x55].
 
-        Goes into the same dispatcher as the antenna's USB CLI, so 'calibrate',
+        Goes into the same dispatcher as the Platform's USB CLI, so 'calibrate',
         'rotated on', 'q 15', 'save al', ... all work. No telemetry reply.
         """
         payload = text.encode("ascii", "ignore")[:95]
@@ -339,17 +341,42 @@ class SerialComm:
 
         Returns ``(ts, motors, rp, l, flags, crack_size)``. NaN Rp/L is returned
         (not dropped) so a dead/misconfigured sensor stays visible upstream.
+
+        The Platform interleaves CLI reply frames (0xAC) with telemetry frames
+        (0xAA) on the same link, so we demux both here -- reply text is decoded
+        and queued onto ``self.responses`` for the UI; the first telemetry frame
+        is returned.
         """
         end_time = time.time() + (timeout_ms / 1000.0)
         while time.time() < end_time:
             if self.ser.in_waiting:
                 self.read_buffer += self.ser.read(self.ser.in_waiting)
 
-            start_idx = self.read_buffer.find(bytes([PKT_START]))
-            if start_idx >= 0 and len(self.read_buffer) >= start_idx + RESP_LEN:
-                packet = self.read_buffer[start_idx:start_idx + RESP_LEN]
-                if packet[RESP_LEN - 1] == PKT_END:
-                    data = packet[1:RESP_LEN - 1]
+            packet = self._consume_frames()
+            if packet is not None:
+                return packet
+            time.sleep(0.0001)
+        return None
+
+    def _consume_frames(self):
+        """Parse complete frames from the front of read_buffer, in order.
+
+        Reply frames are decoded onto ``self.responses``; the first telemetry
+        frame found is returned (``(ts, motors, rp, l, flags, crack_size)``) and
+        parsing stops there. Unrecognized bytes are dropped to resync. Returns
+        None when no telemetry frame is ready (buffer empty or only partial).
+        """
+        buf = self.read_buffer
+        n = len(buf)
+        i = 0
+        result = None
+        while i < n:
+            b = buf[i]
+            if b == PKT_START:
+                if n - i < RESP_LEN:
+                    break                                   # incomplete; wait
+                if buf[i + RESP_LEN - 1] == PKT_END:
+                    data = buf[i + 1:i + RESP_LEN - 1]
                     try:
                         ts, = struct.unpack("<Q", data[0:8])
                         motors = struct.unpack("<hh", data[8:12])
@@ -357,20 +384,44 @@ class SerialComm:
                         l, = struct.unpack("<f", data[16:20])
                         flags = data[20]
                         crack_size, = struct.unpack("<f", data[21:25])
-                        self.read_buffer = self.read_buffer[start_idx + RESP_LEN:]
-                        return ts, motors, rp, l, flags, crack_size
-                    except Exception:
-                        self.read_buffer = self.read_buffer[1:]
-                else:
-                    self.read_buffer = self.read_buffer[1:]
-            elif start_idx < 0 and len(self.read_buffer) > 64:
-                self.read_buffer = self.read_buffer[-64:]
-            time.sleep(0.0001)
-        return None
+                        result = (ts, motors, rp, l, flags, crack_size)
+                        i += RESP_LEN
+                        break
+                    except struct.error:
+                        i += 1                               # malformed; resync
+                        continue
+                i += 1                                       # bad END; resync
+                continue
+            if b == REPLY_START:
+                if n - i < 2:
+                    break                                    # need length byte
+                length = buf[i + 1]
+                frame_end = i + 2 + length                   # index of END byte
+                if n <= frame_end:
+                    break                                    # payload incomplete
+                if buf[frame_end] == PKT_END:
+                    text = buf[i + 2:frame_end].decode("ascii", "replace")
+                    self.responses.append(text)
+                    i = frame_end + 1
+                    continue
+                i += 1                                       # bad frame; resync
+                continue
+            i += 1                                           # junk byte; drop
+        self.read_buffer = buf[i:]
+        return result
+
+    def drain_responses(self):
+        """Return and clear queued Platform CLI reply lines."""
+        if not self.responses:
+            return []
+        lines = self.responses
+        self.responses = []
+        return lines
 
     def clear_buffer(self):
         self.ser.reset_input_buffer()
         self.read_buffer = b""
+        self.responses = []
 
     def close(self):
         try:
@@ -501,7 +552,7 @@ class JoystickControl:
     """Reads an Xbox controller into tank-drive PWM and dispatches button binds.
 
     Button handlers reach the GUI through module-level functions (place_marker /
-    reset_view / quit) and queue antenna CLI commands on the shared
+    reset_view / quit) and queue Platform CLI commands on the shared
     ``command_queue`` drained by the control loop.
     """
 
@@ -766,7 +817,7 @@ class ScannerState:
 link = LinkManager(BAUDRATE)
 csv_logger = CsvLogger(CSV_FILE)
 state = ScannerState()
-command_queue = []                  # antenna CLI commands, drained each control tick
+command_queue = []                  # Platform CLI commands, drained each control tick
 
 # Joystick is optional -- without it the loop still polls telemetry (sending a
 # 0/0 motor command), which is exactly what calibration needs (data flowing).
@@ -1161,7 +1212,7 @@ right_lower_layout.addWidget(crack_frame)
 right_lower_layout.addWidget(connection_frame)
 lower_row_layout.addWidget(right_lower_container, 1)
 
-# --- Lower-left: readouts + antenna CLI console + CSV write controls -------
+# --- Lower-left: readouts + Platform CLI console + CSV write controls -------
 controls_container = QtWidgets.QWidget()
 controls_layout = QtWidgets.QVBoxLayout(controls_container)
 controls_layout.setContentsMargins(0, 4, 0, 0)
@@ -1206,9 +1257,9 @@ readout_container = QtWidgets.QWidget()
 readout_container.setLayout(readout_layout)
 controls_layout.addWidget(readout_container)
 
-# Antenna CLI console (configure the LDC1101: calibrate, q 15, save al, ...).
+# Platform CLI console (configure the LDC1101: calibrate, q 15, save al, ...).
 serial_command_input = QtWidgets.QLineEdit()
-serial_command_input.setPlaceholderText("Antenna CLI: status  help  q 15  calibrate  rotated on  save al")
+serial_command_input.setPlaceholderText("Platform CLI: status  help  q 15  calibrate  rotated on  save al")
 serial_command_input.setMinimumWidth(220)
 
 serial_send_button = QtWidgets.QPushButton("Send")
@@ -1225,9 +1276,23 @@ serial_response_box.setReadOnly(True)
 serial_response_box.setMinimumWidth(320)
 serial_response_box.setMaximumHeight(120)
 serial_response_box.setPlainText(
-    "Antenna CLI commands are sent over the bridge (fire-and-forget).\n"
-    "Replies print on the antenna's USB-CDC port, not back here."
+    "Platform CLI: type a command and press Send.\n"
+    "Replies stream back here (may lag a tick or two)."
 )
+
+# Rolling transcript for the Platform CLI console (sent commands + replies).
+SERIAL_RESPONSE_MAX_LINES = 200
+serial_response_history = []
+
+
+def append_serial_response(text, prefix=""):
+    """Append a line to the Platform CLI transcript and scroll to the bottom."""
+    serial_response_history.append(f"{prefix}{text}")
+    if len(serial_response_history) > SERIAL_RESPONSE_MAX_LINES:
+        del serial_response_history[:-SERIAL_RESPONSE_MAX_LINES]
+    serial_response_box.setPlainText("\n".join(serial_response_history))
+    scrollbar = serial_response_box.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
 
 serial_controls_layout = QtWidgets.QVBoxLayout()
 serial_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -1383,12 +1448,12 @@ def send_serial_command():
     if not command:
         return
     if not link.is_connected:
-        serial_response_box.setPlainText("Not connected -- connect the link first.")
+        append_serial_response("Not connected -- connect the link first.", prefix="! ")
         return
     command_queue.append(command)
     state.stage_command_exchange(command, "")        # annotate next CSV row
-    serial_response_box.setPlainText(f"sent -> antenna: {command}")
-    print(f"\n[CLI] queued -> antenna: {command!r}")
+    append_serial_response(command, prefix=">> ")
+    print(f"\n[CLI] queued -> Platform: {command!r}")
     serial_command_input.clear()
     serial_command_input.setFocus()
 
@@ -1435,7 +1500,7 @@ def control_tick():
         except Exception as exc:
             print(f"\nJoystick read failed: {exc}")
 
-    # Drain queued antenna CLI commands (console + button binds).
+    # Drain queued Platform CLI commands (console + button binds).
     if command_queue:
         for cmd in list(command_queue):
             try:
@@ -1455,6 +1520,11 @@ def control_tick():
     frame_info = grab_camera_frame(record=recording)
 
     packet = link.comm.read_ldc_packet(TELEMETRY_TIMEOUT_MS)
+
+    # Show any Platform CLI replies that arrived this tick (status/help/OK/ERR...).
+    for line in link.comm.drain_responses():
+        append_serial_response(line)
+
     if packet is None:
         state.timeout_count += 1
         append_incoming_line(

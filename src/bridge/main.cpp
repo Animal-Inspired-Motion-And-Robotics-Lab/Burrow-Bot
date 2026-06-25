@@ -19,7 +19,7 @@ void setup() {
   // USB to PC
   Serial.begin(BAUD_RATE);
   
-  // UART to Antenna
+  // UART to Platform
   Serial1.begin(BAUD_RATE, SERIAL_8N1, BRIDGE_RX_PIN, BRIDGE_TX_PIN);
   
   // Small buffers are fine - we forward immediately 
@@ -33,12 +33,12 @@ void setup() {
 }
 
 void loop() {
-  // Forward PC → Antenna (motor commands)
+  // Forward PC → Platform (motor commands)
   if (Serial.available()) {
     Serial1.write(Serial.read());
   }
   
-  // Forward Antenna → PC (IMU data)
+  // Forward Platform → PC (IMU data)
   if (Serial1.available()) {
     Serial.write(Serial1.read());
   }

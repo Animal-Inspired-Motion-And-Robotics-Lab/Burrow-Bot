@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "cmd_reply.h"
 #include "crack_detection.h"
 #include "measurement_arrays.h"
 
@@ -279,7 +280,7 @@ void memoryListMaterials(void) {
   Preferences idx;
   // Read-only begin() fails if nothing has ever been saved.
   if (!idx.begin(kIndexNamespace, true)) {
-    Serial.println("materials: none");
+    Reply.println("materials: none");
     return;
   }
 
@@ -289,11 +290,11 @@ void memoryListMaterials(void) {
   idx.end();
 
   if (buf[0] == '\0') {
-    Serial.println("materials: none");
+    Reply.println("materials: none");
     return;
   }
 
-  Serial.println("materials:");
+  Reply.println("materials:");
   char name[MEMORY_MAX_NAME_LEN + 1];
   const char* p = buf;
   while (*p != '\0') {
@@ -313,10 +314,10 @@ void memoryListMaterials(void) {
         prefs.end();
       }
 
-      Serial.print("  ");
-      Serial.print(name);
-      Serial.print(" angle=");
-      Serial.println(angle, 6);
+      Reply.print("  ");
+      Reply.print(name);
+      Reply.print(" angle=");
+      Reply.println(angle, 6);
     }
     if (nl == nullptr) {break;}
     p = nl + 1;
@@ -328,7 +329,7 @@ void memoryMatchByAngle(float target_angle_rad) {
   // keep the one whose orientation is closest to the target.
   Preferences idx;
   if (!idx.begin(kIndexNamespace, true)) {
-    Serial.println("material: none saved");
+    Reply.println("material: none saved");
     return;
   }
 
@@ -338,7 +339,7 @@ void memoryMatchByAngle(float target_angle_rad) {
   idx.end();
 
   if (buf[0] == '\0') {
-    Serial.println("material: none saved");
+    Reply.println("material: none saved");
     return;
   }
 
@@ -378,19 +379,19 @@ void memoryMatchByAngle(float target_angle_rad) {
   }
 
   if (bestName[0] == '\0') {
-    Serial.println("material: no saved angles to compare");
+    Reply.println("material: no saved angles to compare");
     return;
   }
 
   // Report-only: print the match; the operator runs `retrieve` to load it.
-  Serial.print("material: closest=");
-  Serial.print(bestName);
-  Serial.print(" saved_angle=");
-  Serial.print(bestAngle, 6);
-  Serial.print(" current_angle=");
-  Serial.print(target_angle_rad, 6);
-  Serial.print(" diff_rad=");
-  Serial.print(bestDist, 6);
-  Serial.print(" diff_deg=");
-  Serial.println(bestDist * (180.0f / kPi), 3);
+  Reply.print("material: closest=");
+  Reply.print(bestName);
+  Reply.print(" saved_angle=");
+  Reply.print(bestAngle, 6);
+  Reply.print(" current_angle=");
+  Reply.print(target_angle_rad, 6);
+  Reply.print(" diff_rad=");
+  Reply.print(bestDist, 6);
+  Reply.print(" diff_deg=");
+  Reply.println(bestDist * (180.0f / kPi), 3);
 }

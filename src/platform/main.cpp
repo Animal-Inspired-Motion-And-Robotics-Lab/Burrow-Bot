@@ -5,7 +5,7 @@
 // | |    | | (_| | |_| || (_) | |  | | | | | |
 // |_|    |_|\__,_|\__|_| \___/|_|  |_| |_| |_|
 //
-// ===== ANTENNA - RESPONDER MODE + ON-DEVICE LDC PIPELINE =====
+// ===== PLATFORM - RESPONDER MODE + ON-DEVICE LDC PIPELINE =====
 // Request/response over Serial1 (binary protocol to the PC via the bridge):
 // waits for a motor command, drives the motors, reads the LDC1101, runs the
 // ECLAIR crack-detection pipeline, and replies with an extended telemetry
@@ -37,8 +37,8 @@ const char* fw_version = "0.3.0-burrow";
 #define BAUD_RATE 460800
 
 // Packet markers
-#define PKT_START 0xAA  // motor command frame (PC->antenna) and telemetry frame (antenna->PC)
-#define CMD_START 0xAB  // ASCII CLI command frame (PC->antenna): [0xAB][len][ascii][0x55]
+#define PKT_START 0xAA  // motor command frame (PC->Platform) and telemetry frame (Platform->PC)
+#define CMD_START 0xAB  // ASCII CLI command frame (PC->Platform): [0xAB][len][ascii][0x55]
 #define PKT_END 0x55
 
 // Pins
@@ -51,7 +51,7 @@ const char* fw_version = "0.3.0-burrow";
 #define BIN1 3
 #define BIN2 4
 
-// Antenna status LED (active-high on this board).
+// Platform status LED (active-high on this board).
 #define LED_PIN 21
 
 // ===== LDC PIPELINE BOOT DEFAULTS =====
@@ -60,7 +60,7 @@ const char* fw_version = "0.3.0-burrow";
 // the smallest of the 11.8 / 42.6 / 90.0 uH stack) and 220 pF tank.
 static constexpr float kSensorL_H = 11.8e-6f;  // H
 static constexpr float kSensorC_F = 220e-12f;  // F
-static constexpr float kSensorQ = 30.0f;       // LC tank quality factor
+static constexpr float kSensorQ = 15.0f;       // LC tank quality factor
 
 // External mux/switch driven by the driver before configuring. Unused here.
 static constexpr int kSwitchEnable = 0;
@@ -70,7 +70,7 @@ static constexpr int kSwitchGpio = -1;
 // reading_delay_ms is unused on this firmware (kept at 0).
 static constexpr uint32_t kDefaultReadingDelayMs = 0;
 
-// Onboard LED polarity (XIAO active-low; this antenna LED on pin 21 is active-high).
+// Onboard LED polarity (XIAO active-low; this Platform LED on pin 21 is active-high).
 static constexpr bool kLedActiveHigh = true;
 
 // Moving-average smoothing window applied before rotation/storage (1 disables).
@@ -195,11 +195,11 @@ void setup() {
   };
   crackDetectionInit(&crackConfig);
 
-  Serial.println("Burrow-Bot antenna: LDC1101 pipeline initialized");
+  Serial.println("Burrow-Bot Platform: LDC1101 pipeline initialized");
 }
 
 // ===== HANDLE CLI COMMAND FRAME =====
-// PC -> antenna command frame: [0xAB][len u8][len ASCII bytes][0x55]. Feeds the
+// PC -> Platform command frame: [0xAB][len u8][len ASCII bytes][0x55]. Feeds the
 // ASCII command into the same dispatcher as the USB CLI (calibrate, rotated
 // on|off, save <name>, ...). Bounded waits keep a torn frame from stalling the
 // loop; Serial1.setTimeout() (set in setup) caps the payload read.

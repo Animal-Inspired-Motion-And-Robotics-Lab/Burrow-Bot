@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "cmd_reply.h"
 #include "ldc1101.h"
 #include "measurement_arrays.h"
 
@@ -49,19 +50,19 @@ calibration_result_t calibrationRun(float sensor_c_f, size_t requested_samples) 
 // `calibrate` so the operator sees both the angle and the sample counts.
 void calibrationPrintResult(const calibration_result_t* result) {
   if (result == nullptr) {
-    Serial.println("ERR calibration result is null");
+    Reply.println("ERR calibration result is null");
     return;
   }
 
-  Serial.print("calibrate done samples=");
-  Serial.print((unsigned int)result->samples_requested);
-  Serial.print(" accepted=");
-  Serial.println((unsigned int)result->samples_accepted);
+  Reply.print("calibrate done samples=");
+  Reply.print((unsigned int)result->samples_requested);
+  Reply.print(" accepted=");
+  Reply.println((unsigned int)result->samples_accepted);
 
-  Serial.print("dominant_angle_rad=");
-  Serial.println(result->dominant_angle_rad, 6);
-  Serial.print("dominant_angle_deg=");
-  Serial.println(result->dominant_angle_deg, 3);
+  Reply.print("dominant_angle_rad=");
+  Reply.println(result->dominant_angle_rad, 6);
+  Reply.print("dominant_angle_deg=");
+  Reply.println(result->dominant_angle_deg, 3);
 }
 
 // Capture a fresh rotation center from the most recent `requested_samples`
@@ -100,17 +101,17 @@ baseline_result_t baselineRun(size_t requested_samples) {
 // CLI output stays predictable.
 void baselinePrintResult(const baseline_result_t* result) {
   if (result == nullptr) {
-    Serial.println("ERR baseline result is null");
+    Reply.println("ERR baseline result is null");
     return;
   }
 
-  Serial.print("baseline done samples=");
-  Serial.print((unsigned int)result->samples_requested);
-  Serial.print(" accepted=");
-  Serial.println((unsigned int)result->samples_accepted);
+  Reply.print("baseline done samples=");
+  Reply.print((unsigned int)result->samples_requested);
+  Reply.print(" accepted=");
+  Reply.println((unsigned int)result->samples_accepted);
 
-  Serial.print("center_rp=");
-  Serial.println(result->center_rp, 6);
-  Serial.print("center_l=");
-  Serial.println(result->center_l, 6);
+  Reply.print("center_rp=");
+  Reply.println(result->center_rp, 6);
+  Reply.print("center_l=");
+  Reply.println(result->center_l, 6);
 }

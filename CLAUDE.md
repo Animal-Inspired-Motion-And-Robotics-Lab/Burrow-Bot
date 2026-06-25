@@ -12,7 +12,7 @@ ECLAIR pipeline was migrated here in 2026-06 (see "LDC pipeline integration").
 ## System architecture (three pieces, one PlatformIO project)
 
 ```
- PC (pc_control, Python)  <--USB-->  Bridge ESP32  <--UART-->  Platform ESP32 (antenna)
+ PC (pc_control, Python)  <--USB-->  Bridge ESP32  <--UART-->  Platform ESP32
    joystick + plotting +              transparent              motors + LDC1101 +
    HDF5/video recording               byte forwarder           crack pipeline
 ```
@@ -24,7 +24,7 @@ ECLAIR pipeline was migrated here in 2026-06 (see "LDC pipeline integration").
 - **Bridge** — `src/bridge/main.cpp`. A XIAO ESP32-S3 that forwards every byte
   USB↔UART in both directions, unframed. **Protocol-agnostic — never needs to
   change when the packet format changes.**
-- **Platform / antenna** — `src/platform/main.cpp` + the pipeline modules. The
+- **Platform** — `src/platform/main.cpp` + the pipeline modules. The
   responder: waits for a motor command, drives the DRV8835 motors, reads the
   LDC1101, runs the crack pipeline, replies with a telemetry packet.
 
@@ -34,20 +34,20 @@ PlatformIO Core lives at `~/.platformio/penv/Scripts/pio.exe` (not on PATH).
 
 ```bash
 PIO="$HOME/.platformio/penv/Scripts/pio.exe"
-"$PIO" run -e platform              # build antenna firmware (default env)
+"$PIO" run -e platform              # build Platform firmware (default env)
 "$PIO" run -e bridge                # build bridge firmware
-"$PIO" run -e platform -t upload    # flash antenna
+"$PIO" run -e platform -t upload    # flash Platform
 "$PIO" run -e bridge   -t upload    # flash bridge
 ```
 
 Both boards are `seeed_xiao_esp32s3`, Arduino framework. `build_src_filter`
 splits the two firmwares: `+<platform/*>` vs `+<bridge/*>`, so the pipeline
-sources under `src/platform/` only compile into the antenna build.
+sources under `src/platform/` only compile into the Platform build.
 
 `pc_control` deps are in `requirements.txt` (pyserial, pygame, opencv, h5py,
 numpy, pyqtgraph).
 
-## Telemetry packet (antenna → PC, little-endian, 27 bytes)
+## Telemetry packet (Platform → PC, little-endian, 27 bytes)
 
 Defined in `src/platform/main.cpp` (`sendLDCResponse`) and parsed in the Python
 app (`SerialComm.read_ldc_packet`, `RESP_LEN = 27`). Keep the two in sync.
@@ -64,18 +64,31 @@ app (`SerialComm.read_ldc_packet`, `RESP_LEN = 27`). Keep the two in sync.
 | 22..25 | f32    | crack_size   | thou (fit peak height × length scale)        |
 | 26     | u8     | END 0x55     |                                              |
 
-Motor command (PC → antenna): 6 bytes
+Motor command (PC → Platform): 6 bytes
 `[0xAA][L i16 big-endian][R i16 big-endian][0x55]`.
 
-CLI command frame (PC → antenna): `[0xAB][len u8][len ASCII bytes][0x55]`. The
-antenna recognizes `0xAB` in `readMotorCommand()`'s wait loop and feeds the text
+CLI command frame (PC → Platform): `[0xAB][len u8][len ASCII bytes][0x55]`. The
+Platform recognizes `0xAB` in `readMotorCommand()`'s wait loop and feeds the text
 to `serialCommandsProcessLine()` — the **same dispatcher as the USB CLI**, so any
 CLI command works (`calibrate`, `rotated on|off`, `save <name>`, `crack_*`, ...).
 Command frames get no telemetry reply. PC side: `SerialComm.send_command(text)`;
 joystick buttons enqueue into `JoystickControl.pending_commands`, drained each
-loop. Stick-clicks are bound: **L-click = `calibrate`, R-click = toggle
+loop.
+
+CLI reply frame (Platform → PC): `[0xAC][len u8][len ASCII bytes][0x55]`, one per
+output line. The CLI dispatcher and its helpers (`serial_commands`,
+`calibration`, `memory`) print through the `Reply` tee (`cmd_reply.h/.cpp`)
+instead of `Serial` directly: it always mirrors to the USB-CDC `Serial`, and
+while `serialCommandsProcessLine()` brackets a bridge-sourced command with
+`Reply.beginBridgeCapture()/endBridgeCapture()` it also frames each line onto
+`Serial1`. (Teleplot in `telemetry.cpp` still writes `Serial` directly — only
+command output is framed, not the high-rate stream.) The PC demuxes `0xAA`
+telemetry and `0xAC` reply frames from the one stream in
+`SerialComm._consume_frames()`; reply lines queue onto `SerialComm.responses`,
+drained each `control_tick` into the GUI's Platform-CLI transcript. Replies are
+**not** synchronous — they appear a tick or two after the command. Stick-clicks are bound: **L-click = `calibrate`, R-click = toggle
 `rotated`** (toggle state synced from telemetry flag bit1). Note `calibrate`
-blocks the antenna ~600 ms (its `ledFlash`), so do it stationary.
+blocks the Platform ~600 ms (its `ledFlash`), so do it stationary.
 
 To add a telemetry field: append before END, bump `RESP_LEN` and the firmware
 buffer size + END index together.
@@ -110,7 +123,7 @@ host come from `-D` build flags in `platformio.ini`:
 
 ## Two serial ports (the key integration decision)
 
-The antenna uses **both** UARTs, which sidesteps the ECLAIR demo's serial
+The Platform uses **both** UARTs, which sidesteps the ECLAIR demo's serial
 conflict entirely:
 - **`Serial1`** (pins RX=44 / TX=43) — the binary motor/telemetry protocol to
   the PC via the bridge. The robot's real-time control link.
@@ -120,12 +133,12 @@ conflict entirely:
 ## Calibration workflow (operator, over USB)
 
 Cracks are only flagged **after calibration** (flags bit1). To calibrate a
-substrate: connect USB to the antenna, ensure the PC control app is running
+substrate: connect USB to the Platform, ensure the PC control app is running
 (data must be flowing — the pipeline only advances on motor requests), then over
 the USB serial CLI: `calibrate` → optionally `save <material>` / `retrieve
 <material>` / `materials`. `help` / `status` list everything.
 
-## Pin map (antenna, XIAO ESP32-S3)
+## Pin map (Platform, XIAO ESP32-S3)
 
 | Pins        | Use                                          |
 |-------------|----------------------------------------------|
@@ -136,7 +149,7 @@ the USB serial CLI: `calibrate` → optionally `save <material>` / `retrieve
 
 The original code also init'd I2C on SDA=5/SCL=6 for an (unused) IMU — removed
 during integration because SCL=6 collided with LDC CS=6. **Verify CS=6 matches
-the actual antenna wiring before flashing.**
+the actual Platform wiring before flashing.**
 
 ## Gotchas
 

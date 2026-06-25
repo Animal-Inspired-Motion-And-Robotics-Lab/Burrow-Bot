@@ -38,7 +38,7 @@ LOOP_INTERVAL = 1.0 / HERTZ
 
 # Packet markers
 PKT_START = 0xAA   # motor command frame + telemetry frame
-CMD_START = 0xAB   # ASCII CLI command frame to the antenna: [0xAB][len][ascii][0x55]
+CMD_START = 0xAB   # ASCII CLI command frame to the Platform: [0xAB][len][ascii][0x55]
 PKT_END = 0x55
 
 # Response packet length (firmware src/platform/main.cpp):
@@ -96,7 +96,7 @@ plot_curve_time_rp: Any = None
 plot_curve_scatter: Any = None
 plot_readout: Any = None  # live LDC1101 packet readout (LabelItem)
 plot_container: Any = None  # top-level QWidget wrapping plots + CLI input row
-plot_cmd_input: Any = None  # QLineEdit for typing antenna CLI commands
+plot_cmd_input: Any = None  # QLineEdit for typing Platform CLI commands
 plot_cmd_status: Any = None  # QLabel echoing the last command sent
 vb_right: Any = None
 plot_pg: Any = None
@@ -179,7 +179,7 @@ def init_plot_window(joystick=None):
         )
 
         # ----- Wrap the plots in a container that also holds a CLI input row -----
-        # Lets the operator type antenna CLI commands (status, q 15, calibrate,
+        # Lets the operator type Platform CLI commands (status, q 15, calibrate,
         # save al, ...) straight from the plot window. Commands are queued onto
         # joystick.pending_commands and the main loop sends them over the bridge
         # via serial_comm.send_command() (the [0xAB][len][ascii][0x55] frame).
@@ -190,7 +190,7 @@ def init_plot_window(joystick=None):
         vbox.addWidget(plot_layout)
 
         cmd_row = plot_QtGui.QHBoxLayout()
-        cmd_label = plot_QtGui.QLabel("Antenna CLI:")
+        cmd_label = plot_QtGui.QLabel("Platform CLI:")
         plot_cmd_input = plot_QtGui.QLineEdit()
         plot_cmd_input.setPlaceholderText("e.g.  status   help   q 15   calibrate   save al")
         plot_cmd_send = plot_QtGui.QPushButton("SEND")
@@ -211,7 +211,7 @@ def init_plot_window(joystick=None):
                 # as the stick-click calibrate/rotate bindings.
                 joystick.pending_commands.append(text)
                 plot_cmd_status.setText(f"sent: {text}")
-                print(f"\n[CLI] queued -> antenna: {text!r}")
+                print(f"\n[CLI] queued -> Platform: {text!r}")
             else:
                 plot_cmd_status.setText("no link")
             plot_cmd_input.clear()
@@ -251,9 +251,9 @@ class SerialComm:
         self.ser.write(packet)
 
     def send_command(self, text):
-        """Send an ASCII CLI command to the antenna: [0xAB][len][ascii][0x55].
+        """Send an ASCII CLI command to the Platform: [0xAB][len][ascii][0x55].
 
-        The antenna feeds it into the same dispatcher as its USB serial CLI, so
+        The Platform feeds it into the same dispatcher as its USB serial CLI, so
         any CLI command works here (e.g. 'calibrate', 'rotated on', 'save al')."""
         payload = text.encode('ascii', 'ignore')[:95]
         packet = bytearray([CMD_START, len(payload)])
@@ -424,7 +424,7 @@ class JoystickControl:
         self.smoothing_window = 10
 
         # On-device CLI commands queued by button presses, drained in the main
-        # loop and sent to the antenna. `rotated` mirrors the device's rotation
+        # loop and sent to the Platform. `rotated` mirrors the device's rotation
         # state (kept in sync from telemetry flags) so the toggle stays correct.
         self.pending_commands = []
         self.rotated = False
