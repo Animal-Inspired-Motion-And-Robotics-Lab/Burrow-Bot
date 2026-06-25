@@ -113,12 +113,18 @@ CAMERA_INDEX = 1                    # webcam to record alongside telemetry
 CAMERA_ENABLED = False
 
 # --- Live data buffers -----------------------------------------------------
-MAX_POINTS = 5000                   # ring-buffer length for every sample deque
+# Ring-buffer length for every sample deque. This is also how many points the 2D
+# curves paint each frame (no downsampling -- that caused axis jitter/shimmer), so
+# it's the main knob for redraw cost vs. how much history is shown. Lower = snappier.
+MAX_POINTS = 2500
 # Cap the 3D surface mesh to the most recent N samples (a sliding window). This
 # bounds the per-frame rebuild cost AND stays smooth: the vertex set only changes
 # by the newest/oldest sample each frame, so the ribbon flows instead of jittering
 # (stride-decimation re-picked different points every frame and made it shimmer).
-MAX_SURFACE_POINTS = 2500
+MAX_SURFACE_POINTS = 1200
+# The 3D surface measured cheap (~0.5 ms), so refresh it every redraw (1). Raise
+# only if a slower GL machine shows it dominating the redraw timing.
+SURFACE_UPDATE_EVERY = 1
 
 # --- Plot / readout tuning -------------------------------------------------
 DISPLAY_LAG_POINTS = 1              # skip newest N points to reduce right-edge jitter
@@ -127,6 +133,10 @@ AVERAGE_UPDATE_INTERVAL_SEC = 5.0
 RP_ZERO_EPSILON = 1e-12             # R_p span at/below this counts as "flat/zero"
 RP_ZERO_FALLBACK_WINDOW = 100       # samples inspected when deciding R_p is flat
 INCOMING_HISTORY_LINES = 3          # rolling raw-packet readout depth
+
+# Shared colour for crack indicators: the stem ticks (lower-right plot) and the
+# crack 'x' markers on the phase plot use this so they always match.
+CRACK_COLOR = (255, 190, 140, 230)
 
 # --- Plot line-width scaling (percent; 100 == original width) --------------
 SURFACE_TRACE_LINE_WIDTH_PERCENT = 100
@@ -552,8 +562,20 @@ class _ControllerReader(threading.Thread):
             return
 
         self.ready.set()
+        # TEMP perf: report the pygame pump cost (holds the GIL while it runs, so
+        # a slow pump here starves the GUI thread) every 2 s.
+        pump_sum = 0.0
+        pump_cnt = 0
+        pump_max = 0.0
+        last_report = time.monotonic()
         while self._running:
-            for event in pygame.event.get():        # also pumps; the slow part
+            t0 = time.perf_counter()
+            events = pygame.event.get()             # also pumps; the slow part
+            dt = time.perf_counter() - t0
+            pump_sum += dt
+            pump_cnt += 1
+            pump_max = max(pump_max, dt)
+            for event in events:
                 if event.type == pygame.JOYBUTTONDOWN:
                     self.buttons.put(event.button)
             try:
@@ -564,6 +586,14 @@ class _ControllerReader(threading.Thread):
             with self._lock:
                 self._axis1 = a1
                 self._axis3 = a3
+            now = time.monotonic()
+            if now - last_report >= 2.0 and pump_cnt:
+                print(f"[perf] js_pump: avg={pump_sum / pump_cnt * 1e3:.1f}ms "
+                      f"max={pump_max * 1e3:.1f}ms n={pump_cnt}")
+                pump_sum = 0.0
+                pump_cnt = 0
+                pump_max = 0.0
+                last_report = now
             time.sleep(0.005)
 
     def axes(self):
@@ -721,6 +751,10 @@ class ScannerState:
         self.crack_times = deque(maxlen=MAX_POINTS)
         self.crack_mags = deque(maxlen=MAX_POINTS)
         self.crack_sizes = deque(maxlen=MAX_POINTS)
+        # Phase-plot (Rp, L) position of each crack, parallel to crack_times, so
+        # the crack overlay can be drawn as one scatter item in either x-mode.
+        self.crack_rp = deque(maxlen=MAX_POINTS)
+        self.crack_l = deque(maxlen=MAX_POINTS)
 
         # Control flags.
         self.paused = False
@@ -757,6 +791,8 @@ class ScannerState:
         self.crack_times.clear()
         self.crack_mags.clear()
         self.crack_sizes.clear()
+        self.crack_rp.clear()
+        self.crack_l.clear()
         self.xy_start_index = 0
         self.last_crack_flag = False
         self.ui_start_monotonic = time.monotonic()
@@ -775,14 +811,16 @@ class ScannerState:
         self.pending_response = ""
         return serial_out, response
 
-    def register_crack(self, t, crack_size):
-        """Record a crack event for the crack plot (one bar at time ``t``)."""
+    def register_crack(self, t, crack_size, rp, l):
+        """Record a crack event: a bar at time ``t`` plus its (Rp, L) position."""
         size = float(crack_size) if crack_size and math.isfinite(crack_size) else 0.0
         self.crack_times.append(float(t))
         # Only crack_size comes from this firmware; use it for both y-modes so
         # the bar has height regardless of which mode the crack axis shows.
         self.crack_mags.append(size if size > 0 else 1.0)
         self.crack_sizes.append(size)
+        self.crack_rp.append(float(rp))
+        self.crack_l.append(float(l))
         self.latest_crack_size = size
 
     def ingest_sample(self, t, rp, l, crack_size, crack_detected, calibrated):
@@ -1002,21 +1040,23 @@ bottom_axis.toggled.connect(toggle_right_x_mode)
 
 initial_xy_view_state = plot_xy.getViewBox().getState(copy=True)
 xy_curve = plot_xy.plot(pen=pg.mkPen("r", width=scale_line_width(1.0, RIGHT_PLOT_MAIN_LINE_WIDTH_PERCENT)))
-# Pre-build the red->white gradient pens once; the per-segment shade is fixed by
-# index, so the redraw only needs setData() (no per-frame mkPen on ~100 curves).
-recent_segment_curves = []
-_seg_total = max(RECENT_FADE_POINTS - 1, 0)
-_seg_width = scale_line_width(3.0, RIGHT_PLOT_RECENT_LINE_WIDTH_PERCENT)
-for _i in range(_seg_total):
-    _shade = int(255 * _i / max(_seg_total - 1, 1))      # red (oldest) -> white (newest)
-    recent_segment_curves.append(
-        plot_xy.plot(pen=pg.mkPen((255, _shade, _shade, 255), width=_seg_width))
-    )
+# Recent-trajectory highlight: ONE bright curve over the last RECENT_FADE_POINTS
+# points. (Was ~99 separate gradient segments painted every frame -- a big fixed
+# cost. A single curve keeps the recency highlight without the per-item overhead.)
+recent_tail_curve = plot_xy.plot(
+    pen=pg.mkPen((255, 255, 255), width=scale_line_width(3.0, RIGHT_PLOT_RECENT_LINE_WIDTH_PERCENT)))
 
-# Persistent overlay markers on the phase plot (material labels + crack X's).
+# Crack 'x' overlays: ONE scatter item for all detections (cheap to paint),
+# instead of a TextItem per crack (those grew unbounded and dragged the redraw
+# down as detections piled up). update() feeds it (Rp,L) or (time,L) per x-mode.
+crack_scatter = pg.ScatterPlotItem(size=10, symbol="x",
+                                   pen=pg.mkPen(CRACK_COLOR, width=2),
+                                   brush=pg.mkBrush(*CRACK_COLOR))
+plot_xy.addItem(crack_scatter)
+
+# Material labels stay individual TextItems (few, user-placed, carry text).
 # Tracked so the per-frame TextItem sweep in update() leaves them alone.
 material_marker_items = []
-crack_marker_items = []
 
 # Lower row: controls (left) + crack plot & connection (right).
 lower_row_layout = QtWidgets.QHBoxLayout()
@@ -1041,7 +1081,7 @@ crack_plot.setLabel("left", "crack_size (thou)")
 crack_plot.showGrid(x=True, y=True, alpha=0.25)
 crack_plot.setYRange(0.0, 1.0, padding=0.0)
 crack_curve = crack_plot.plot(
-    [], [], pen=pg.mkPen((255, 190, 140, 230), width=scale_line_width(1.0, CRACK_PLOT_LINE_WIDTH_PERCENT)),
+    [], [], pen=pg.mkPen(CRACK_COLOR, width=scale_line_width(1.0, CRACK_PLOT_LINE_WIDTH_PERCENT)),
     connect="pairs",
 )
 crack_left_axis.setToolTip("Click y-axis to toggle between crack_size and mag")
@@ -1377,10 +1417,10 @@ def reset_view():
     """Clear all buffers + overlays and restart every plot from scratch."""
     state.reset()
 
-    for marker in material_marker_items + crack_marker_items:
+    for marker in material_marker_items:
         plot_xy.removeItem(marker)
     material_marker_items.clear()
-    crack_marker_items.clear()
+    crack_scatter.setData([], [])       # state.reset() already cleared crack_rp/l
 
     meshdata = gl.MeshData(vertexes=_bootstrap_vertices, faces=_bootstrap_faces)
     meshdata.setFaceColors(_bootstrap_face_colors)
@@ -1390,8 +1430,7 @@ def reset_view():
     surface_view.opts["center"] = QtGui.QVector3D(0.0, 0.0, 0.0)
 
     xy_curve.clear()
-    for seg_curve in recent_segment_curves:
-        seg_curve.setData([], [])
+    recent_tail_curve.setData([], [])
     plot_xy.getViewBox().setState(initial_xy_view_state)
 
     average_label.setText(state.average_text)
@@ -1567,16 +1606,9 @@ def process_packet(packet):
     t_sec = ts / 1e6
     state.ingest_sample(t_sec, rp, l, crack_size, crack_detected, calibrated)
 
-    # Rising-edge crack event -> crack plot + persistent 'x' on the phase plot.
+    # Rising-edge crack event -> crack stem plot + a point on the phase scatter.
     if crack_detected and not state.last_crack_flag:
-        state.register_crack(t_sec, crack_size)
-        marker = pg.TextItem("x", anchor=(0.5, 0.5), color=(255, 0, 0))
-        # Carry both placements so update() can match the phase (Rp) or time x-axis.
-        marker.pos_rp = (rp, l)
-        marker.pos_time = (t_sec, l)
-        marker.setPos(*marker.pos_rp)
-        plot_xy.addItem(marker)
-        crack_marker_items.append(marker)
+        state.register_crack(t_sec, crack_size, rp, l)
         print(f"\n>>> CRACK detected: size~{crack_size:.1f} thou")
     state.last_crack_flag = crack_detected
 
@@ -1587,17 +1619,56 @@ def process_packet(packet):
                                 serial_out, response)
 
 
+_redraw_count = [0]                  # drives the 3D-surface throttle in update()
+
+# TEMP perf: measure every GUI-thread cost so we target the real one. control_gap
+# is the interval between 100 Hz control ticks (~10 ms if healthy; much higher
+# means the thread is being starved -- e.g. by the joystick thread's GIL hold).
+_perf = {"redraw_total": [0.0, 0, 0.0], "surface_3d": [0.0, 0, 0.0],
+         "control_run": [0.0, 0, 0.0], "control_gap": [0.0, 0, 0.0]}
+_perf_last = [time.monotonic()]
+_control_last = [time.perf_counter()]
+
+
+def _perf_add(name, dt):
+    s = _perf[name]
+    s[0] += dt
+    s[1] += 1
+    s[2] = max(s[2], dt)
+
+
+def _timed_update():
+    t0 = time.perf_counter()
+    update()
+    _perf_add("redraw_total", time.perf_counter() - t0)
+    now = time.monotonic()
+    if now - _perf_last[0] >= 2.0:
+        parts = []
+        for k, s in _perf.items():
+            if s[1]:
+                parts.append(f"{k}: avg={s[0] / s[1] * 1e3:.1f}ms max={s[2] * 1e3:.1f}ms n={s[1]}")
+            _perf[k] = [0.0, 0, 0.0]
+        print("[perf] " + " | ".join(parts))
+        _perf_last[0] = now
+
+
+def _timed_control():
+    t0 = time.perf_counter()
+    _perf_add("control_gap", t0 - _control_last[0])   # interval between ticks
+    _control_last[0] = t0
+    control_tick()
+    _perf_add("control_run", time.perf_counter() - t0)
+
+
 def update():
     """Redraw timer: recompute readouts and repaint all plots."""
+    _redraw_count[0] += 1
     readout_label.setText(state.readout_text)
 
-    # Re-apply user-configured line widths each frame so style never gets lost.
-    xy_curve.setPen(pg.mkPen("r", width=scale_line_width(1.0, RIGHT_PLOT_MAIN_LINE_WIDTH_PERCENT)))
-    crack_curve.setPen(pg.mkPen((255, 190, 140, 230), width=scale_line_width(1.0, CRACK_PLOT_LINE_WIDTH_PERCENT)))
-
-    x_all = np.array(state.timestamps)
-    y1_all = np.array(state.sensor1)
-    y2_all = np.array(state.sensor2)
+    # np.fromiter avoids building an intermediate list from the deque each frame.
+    x_all = np.fromiter(state.timestamps, dtype=float)
+    y1_all = np.fromiter(state.sensor1, dtype=float)
+    y2_all = np.fromiter(state.sensor2, dtype=float)
 
     now = time.monotonic()
     if now - state.last_average_update_time >= AVERAGE_UPDATE_INTERVAL_SEC:
@@ -1652,18 +1723,23 @@ def update():
     if len(x_plot) == 0:
         return
 
-    surface_data = build_surface_data(x_plot, y1_plot, y2_plot)
-    if surface_data is not None:
-        vertices, faces, face_colors, line_pos = surface_data
-        meshdata = gl.MeshData(vertexes=vertices, faces=faces)
-        meshdata.setFaceColors(face_colors)
-        surface_item.setMeshData(meshdata=meshdata)
-        surface_trace.setData(pos=line_pos, width=scale_line_width(2.0, SURFACE_TRACE_LINE_WIDTH_PERCENT))
-        surface_head.setData(pos=line_pos[-1:].copy())
-        surface_view.opts["center"] = QtGui.QVector3D(0.0, 0.0, 0.0)
+    # The 3D mesh rebuild/upload is the most expensive part of a redraw, so only
+    # refresh it every SURFACE_UPDATE_EVERY frames (the 2D plots stay every-frame).
+    _ts0 = time.perf_counter()
+    if _redraw_count[0] % SURFACE_UPDATE_EVERY == 0:
+        surface_data = build_surface_data(x_plot, y1_plot, y2_plot)
+        if surface_data is not None:
+            vertices, faces, face_colors, line_pos = surface_data
+            meshdata = gl.MeshData(vertexes=vertices, faces=faces)
+            meshdata.setFaceColors(face_colors)
+            surface_item.setMeshData(meshdata=meshdata)
+            surface_trace.setData(pos=line_pos, width=scale_line_width(2.0, SURFACE_TRACE_LINE_WIDTH_PERCENT))
+            surface_head.setData(pos=line_pos[-1:].copy())
+            surface_view.opts["center"] = QtGui.QVector3D(0.0, 0.0, 0.0)
+    _perf_add("surface_3d", time.perf_counter() - _ts0)  # TEMP perf
 
     # Sweep transient TextItems off the XY plot, but keep persistent overlays.
-    persistent = set(id(m) for m in material_marker_items) | set(id(m) for m in crack_marker_items)
+    persistent = set(id(m) for m in material_marker_items)
     for item in plot_xy.items[:]:
         if isinstance(item, pg.TextItem) and id(item) not in persistent:
             plot_xy.removeItem(item)
@@ -1683,10 +1759,18 @@ def update():
 
     right_uses_time_x = (state.right_x_mode == "TIME") or state.right_plot_auto_time_fallback
 
-    # The phase-plot overlays (crack X's + material labels) carry both an (Rp, L)
-    # and a (time, L) position. Place them to match whichever x the plot is
-    # showing so they stay meaningful in both the phase and L-vs-time views.
-    for _marker in crack_marker_items + material_marker_items:
+    # Crack scatter + material labels carry both an (Rp, L) and a (time, L)
+    # position; show whichever matches the current x-axis so they stay meaningful
+    # in both the phase and L-vs-time views. The crack overlay is one scatter item
+    # (cheap), fed straight from the parallel crack deques.
+    if len(state.crack_l) > 0:
+        crack_y = np.fromiter(state.crack_l, dtype=float)
+        crack_x = (np.fromiter(state.crack_times, dtype=float) if right_uses_time_x
+                   else np.fromiter(state.crack_rp, dtype=float))
+        crack_scatter.setData(crack_x, crack_y)
+    else:
+        crack_scatter.setData([], [])
+    for _marker in material_marker_items:
         _marker.setPos(*(_marker.pos_time if right_uses_time_x else _marker.pos_rp))
 
     if right_uses_time_x:
@@ -1697,33 +1781,24 @@ def update():
 
     xy_curve.setData(x_right, y_right)
 
-    # Highlight the most recent trajectory with a red -> white segment gradient.
+    # Highlight the most recent trajectory with a single bright tail curve.
     tail_count = min(RECENT_FADE_POINTS, len(x_right))
     if tail_count > 1:
-        tail_x = x_right[-tail_count:]
-        tail_y = y_right[-tail_count:]
-        seg_count = min(tail_count - 1, len(recent_segment_curves))
-        # Pens are pre-built (fixed gradient); only push new segment endpoints.
-        for i in range(seg_count):
-            recent_segment_curves[i].setData([tail_x[i], tail_x[i + 1]],
-                                             [tail_y[i], tail_y[i + 1]])
-        for i in range(seg_count, len(recent_segment_curves)):
-            recent_segment_curves[i].setData([], [])
+        recent_tail_curve.setData(x_right[-tail_count:], y_right[-tail_count:])
     else:
-        for seg_curve in recent_segment_curves:
-            seg_curve.setData([], [])
+        recent_tail_curve.setData([], [])
 
 
 # Fast control loop (motor send + non-blocking telemetry drain) + slower redraw,
 # both on the GUI thread, so the redraw is kept cheap to avoid starving control.
 control_timer = QtCore.QTimer()
 control_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-control_timer.timeout.connect(control_tick)
+control_timer.timeout.connect(_timed_control)        # TEMP perf wrapper around control_tick
 control_timer.start(int(LOOP_INTERVAL * 1000))      # ~100 Hz
 
 redraw_timer = QtCore.QTimer()
-redraw_timer.timeout.connect(update)
-redraw_timer.start(50)                               # ~20 fps
+redraw_timer.timeout.connect(_timed_update)          # TEMP perf wrapper around update()
+redraw_timer.start(50)                               # ~20 fps (redraw is cheap, ~10 ms)
 
 
 def close_resources():

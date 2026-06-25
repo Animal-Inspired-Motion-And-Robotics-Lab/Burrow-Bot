@@ -64,8 +64,8 @@ app (`SerialComm.drain_packets` / `_consume_frames`, `RESP_LEN = 27`). Keep in s
 | 1..8   | u64    | timestamp    | `micros()`                                   |
 | 9..10  | i16    | motor L PWM  |                                              |
 | 11..12 | i16    | motor R PWM  |                                              |
-| 13..16 | f32    | Rp (ohms)    | raw; rotated into the calibrated frame if bit1 |
-| 17..20 | f32    | L (uH)       | raw; rotated into the calibrated frame if bit1 |
+| 13..16 | f32    | Rp (ohms)    | smoothed (`smoothing` window); rotated if bit1 |
+| 17..20 | f32    | L (uH)       | smoothed (`smoothing` window); rotated if bit1 |
 | 21     | u8     | flags        | bit0 = crack detected, bit1 = rotated/calibrated |
 | 22..25 | f32    | crack_size   | thou (fit peak height × length scale)        |
 | 26     | u8     | END 0x55     |                                              |
