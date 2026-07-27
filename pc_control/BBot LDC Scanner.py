@@ -708,7 +708,7 @@ class JoystickControl:
         elif button == 0:                   # X - send `calibrate`
             command_queue.append("calibrate")
             print("\n[cmd] calibrate")
-        elif button == 11:                  # R-stick click - vibrate (liftoff dither)
+        elif button in (7, 11):             # RT (7) or R-stick click (11) - vibrate
             command_queue.append("vibrate")
             print("\n[cmd] vibrate")
         elif button == 3:                   # Y - toggle on-device rotation
@@ -1020,7 +1020,7 @@ controls_overlay.setText(
     "A: CSV write   B: material marker\n"
     "X: calibrate   Y: toggle rotation\n"
     "L-click: reset plots   R-click: vibrate   Back/View: quit\n"
-    "MODE: toggle robot drive <-> 3D view (sticks orbit/zoom)"
+    "START: toggle robot drive <-> 3D view (sticks orbit/zoom)"
 )
 controls_overlay.setStyleSheet(
     "color: rgba(200, 200, 200, 150); font-size: 14px; background: transparent;"
@@ -1391,6 +1391,29 @@ serial_response_box.setPlainText(
 # Rolling transcript for the Platform CLI console (sent commands + replies).
 SERIAL_RESPONSE_MAX_LINES = 200
 serial_response_history = []
+serial_command_history = []
+serial_command_history_index = -1
+
+
+def recall_previous_serial_command():
+    """Recall the previous sent command into the CLI input (Up-arrow)."""
+    global serial_command_history_index
+    if not serial_command_history:
+        return
+    idx = serial_command_history_index
+    if idx < 0:
+        idx = len(serial_command_history) - 1
+    else:
+        idx = max(0, idx - 1)
+    serial_command_history_index = idx
+    serial_command_input.setText(serial_command_history[idx])
+    serial_command_input.setCursorPosition(len(serial_command_history[idx]))
+
+
+def reset_serial_command_history_nav(_text):
+    """Reset Up-arrow history navigation when the user edits input text."""
+    global serial_command_history_index
+    serial_command_history_index = -1
 
 
 def append_serial_response(text, prefix=""):
@@ -1559,6 +1582,7 @@ surface_view.keyPressEvent = keyPressEvent
 
 def send_serial_command():
     """Queue the typed CLI command for the control loop to frame and send."""
+    global serial_command_history_index
     command = serial_command_input.text().strip()
     if not command:
         return
@@ -1566,6 +1590,8 @@ def send_serial_command():
         append_serial_response("Not connected -- connect the link first.", prefix="! ")
         return
     command_queue.append(command)
+    serial_command_history.append(command)
+    serial_command_history_index = -1
     state.stage_command_exchange(command, "")        # annotate next CSV row
     append_serial_response(command, prefix=">> ")
     print(f"\n[CLI] queued -> Platform: {command!r}")
@@ -1575,6 +1601,10 @@ def send_serial_command():
 
 serial_send_button.clicked.connect(send_serial_command)
 serial_command_input.returnPressed.connect(send_serial_command)
+serial_command_input.textEdited.connect(reset_serial_command_history_nav)
+serial_history_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Up), serial_command_input)
+serial_history_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetShortcut)
+serial_history_shortcut.activated.connect(recall_previous_serial_command)
 
 
 def update_raw_readout(rp, l, flags, crack_size):
